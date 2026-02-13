@@ -18,11 +18,13 @@ class MessageTool(Tool):
         self._send_callback = send_callback
         self._default_channel = default_channel
         self._default_chat_id = default_chat_id
+        self.sent_to_chat_ids: list[str] = []  # Track where messages were sent
     
     def set_context(self, channel: str, chat_id: str) -> None:
         """Set the current message context."""
         self._default_channel = channel
         self._default_chat_id = chat_id
+        self.sent_to_chat_ids = []  # Reset per message
     
     def set_send_callback(self, callback: Callable[[OutboundMessage], Awaitable[None]]) -> None:
         """Set the callback for sending messages."""
@@ -81,6 +83,7 @@ class MessageTool(Tool):
         
         try:
             await self._send_callback(msg)
+            self.sent_to_chat_ids.append(chat_id)
             return f"Message sent to {channel}:{chat_id}"
         except Exception as e:
             return f"Error sending message: {str(e)}"

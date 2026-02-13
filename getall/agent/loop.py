@@ -368,11 +368,18 @@ class AgentLoop:
                             tools_used=tools_used if tools_used else None)
         self.sessions.save(session)
 
-        # If the agent already sent messages via the message tool,
+        # If the agent already sent messages via the message tool TO THE SAME CHAT,
         # suppress the final outbound to avoid duplicate output.
+        # Messages sent to OTHER chats (e.g. a DM from a group context) don't suppress.
         if "message" in tools_used:
-            logger.debug("Suppressing final outbound — messages already sent via message tool")
-            return None
+            msg_tool = self.tools.get("message")
+            sent_to_same = any(
+                cid == msg.chat_id
+                for cid in getattr(msg_tool, "sent_to_chat_ids", [])
+            )
+            if sent_to_same:
+                logger.debug("Suppressing final outbound — message tool already sent to this chat")
+                return None
         
         return OutboundMessage(
             channel=msg.channel,
