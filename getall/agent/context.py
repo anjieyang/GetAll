@@ -33,6 +33,7 @@ class ContextBuilder:
         skill_names: list[str] | None = None,
         persona: dict[str, str] | None = None,
         memory_scope: str | None = None,
+        chat_type: str | None = None,
     ) -> str:
         """
         Build the system prompt from bootstrap files, memory, and skills.
@@ -41,6 +42,7 @@ class ContextBuilder:
             skill_names: Optional list of skills to include.
             persona: Per-user persona dict with keys: pet_name, persona_text,
                      trading_style_text, ift, onboarded. If None, uses defaults.
+            chat_type: "private" or "group".
         
         Returns:
             Complete system prompt.
@@ -55,6 +57,7 @@ class ContextBuilder:
                 persona=persona,
                 memory_file_path=str(memory_store.memory_file),
                 history_file_path=str(memory_store.history_file),
+                chat_type=chat_type,
             )
         )
         
@@ -93,6 +96,7 @@ Skills with available="false" need dependencies installed first - you can try in
         persona: dict[str, str] | None = None,
         memory_file_path: str | None = None,
         history_file_path: str | None = None,
+        chat_type: str | None = None,
     ) -> str:
         """Get the core identity section, personalised per-user when available."""
         from datetime import datetime
@@ -112,8 +116,20 @@ Skills with available="false" need dependencies installed first - you can try in
         ift = p.get("ift", "")
         onboarded = p.get("onboarded", False)
 
+        is_group = (chat_type or "").lower() == "group"
+
         # ── persona block ──
-        if pet_name and onboarded:
+        if is_group and not (pet_name and onboarded):
+            # Group chat without persona: generic helpful assistant, NO onboarding
+            persona_block = """## Who You Are (Group Mode)
+You are GetAll, a crypto trading assistant. In group chats you answer questions, provide market analysis, and help with trading tasks.
+
+**Group chat rules:**
+- Be concise and helpful. No onboarding, no asking for names or IFT.
+- If someone needs private features (binding exchange, personal settings), tell them to message you privately.
+- @mention the person you're replying to at the start of your message.
+- If your reply references other group members, @mention them too."""
+        elif pet_name and onboarded:
             persona_block = f"""## Who You Are
 Your name is **{pet_name}**. You are this user's personal crypto trading pet.
 
@@ -259,7 +275,7 @@ To recall past events, grep {history_file}"""
         messages = []
 
         # System prompt
-        system_prompt = self.build_system_prompt(skill_names, persona=persona, memory_scope=memory_scope)
+        system_prompt = self.build_system_prompt(skill_names, persona=persona, memory_scope=memory_scope, chat_type=chat_type)
         if channel and chat_id:
             system_prompt += f"\n\n## Current Session\nChannel: {channel}\nChat ID: {chat_id}"
             if chat_type:
