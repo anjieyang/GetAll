@@ -295,15 +295,15 @@ class TelegramChannel(BaseChannel):
             )
             return
 
-        # Let the agent generate a natural start message instead of hardcoded copy.
+        # Let the agent generate a natural start message based on onboarded state.
         start_event_prompt = (
             "System event: the user just sent /start. "
             "Respond strictly from your real current state and avoid contradictions. "
             "If onboarded=true, greet in a familiar tone and move directly to actionable next steps. "
-            "Do NOT proactively repeat your name, IFT, or adoption flow unless the user explicitly asks who you are, your name, or your ID. "
-            "If onboarded=false, clearly state you do not have a name yet and ask the user to name you. "
-            "Avoid conflicting narratives such as 'welcome back' vs 'just adopted'. "
-            "Keep the reply under two sentences and do not use lists."
+            "Do NOT proactively repeat your name, IFT, or adoption flow unless the user explicitly asks. "
+            "If onboarded=false, follow the onboarding flow: first ask if they have an existing IFT from another platform, "
+            "then proceed step by step (do NOT rush all steps into one message). "
+            "Keep this first reply short — just the IFT question and a warm greeting."
         )
         await self._handle_message(
             sender_id=sender_id,
