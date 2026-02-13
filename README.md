@@ -1,5 +1,4 @@
 <div align="center">
-  <img src="getall_logo.png" alt="GetAll" width="500">
   <h1>GetAll: AI-Powered Bitget Trading Assistant</h1>
   <p>
     <img src="https://img.shields.io/badge/python-≥3.11-blue" alt="Python">
@@ -14,12 +13,6 @@
 - Strategy builder, backtesting, and risk management
 - Telegram bot with inline trading UI
 - Multi-provider LLM support (OpenRouter, Claude, GPT, DeepSeek, etc.)
-
-## 🏗️ Architecture
-
-<p align="center">
-  <img src="getall_arch.png" alt="GetAll architecture" width="800">
-</p>
 
 ## 📦 Install
 
