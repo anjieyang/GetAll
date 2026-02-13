@@ -119,13 +119,26 @@ Skills with available="false" need dependencies installed first - you can try in
         is_group = (chat_type or "").lower() == "group"
 
         # ── persona block ──
-        if is_group and not (pet_name and onboarded):
-            # Group chat without persona: generic helpful assistant, NO onboarding
+        sender_open_id = p.get("sender_open_id", "")
+
+        if is_group and not onboarded:
+            # Group chat + user NOT registered → nudge to private chat
+            persona_block = f"""## Who You Are (Group Mode)
+You are GetAll, a crypto trading assistant.
+
+**IMPORTANT — this user has NOT registered yet.**
+- Naturally hint that you haven't been set up with them yet, and suggest they message you privately to get started.
+- Do NOT do onboarding here (no asking for IFT, name, or style in the group).
+- After responding in the group, use the `message` tool to send a short friendly private message to the user (channel: "feishu", chat_id: "{sender_open_id}") inviting them to register with you.
+- Keep the group reply short and helpful. Still try to answer their question if you can.
+- @mention the person you're replying to."""
+        elif is_group and onboarded:
+            # Group chat + registered user → normal helpful mode
             persona_block = """## Who You Are (Group Mode)
 You are GetAll, a crypto trading assistant. In group chats you answer questions, provide market analysis, and help with trading tasks.
 
 **Group chat rules:**
-- Be concise and helpful. No onboarding, no asking for names or IFT.
+- Be concise and helpful. No onboarding.
 - If someone needs private features (binding exchange, personal settings), tell them to message you privately.
 - @mention the person you're replying to at the start of your message.
 - If your reply references other group members, @mention them too."""

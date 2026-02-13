@@ -238,23 +238,32 @@ class AgentLoop:
                     msg.agent_identity_id = resolution.agent_identity_id
                     logger.info(f"Identity resolved: {msg.channel}:{msg.sender_id} -> {resolution.ift}")
 
-            # Step 2: load persona — only for private chats.
-            # In group chats the bot keeps a stable default personality
-            # (from SOUL.md) rather than switching per-sender.
-            if msg.principal_id and not is_group:
+            # Step 2: load persona.
+            # Private chats: full persona for personalized experience.
+            # Group chats: lightweight check (onboarded flag only) so the
+            # bot can nudge unregistered users to private chat.
+            if msg.principal_id:
                 async with factory() as db_session:
                     repo = IdentityRepo(db_session)
                     principal = await repo.get_by_id(msg.principal_id)
                     if principal is not None:
-                        persona = {
-                            "pet_name": principal.pet_name or "",
-                            "persona_text": principal.persona_text or "",
-                            "trading_style_text": principal.trading_style_text or "",
-                            "ift": principal.ift or "",
-                            "onboarded": principal.onboarded,
-                        }
-                        # Set persona tool context so LLM can update persona
-                        self._persona_tool.set_context(principal.id, factory)
+                        if is_group:
+                            # Group: only pass onboarded status + sender info
+                            persona = {
+                                "onboarded": principal.onboarded,
+                                "sender_open_id": msg.sender_id,
+                            }
+                        else:
+                            # Private: full persona
+                            persona = {
+                                "pet_name": principal.pet_name or "",
+                                "persona_text": principal.persona_text or "",
+                                "trading_style_text": principal.trading_style_text or "",
+                                "ift": principal.ift or "",
+                                "onboarded": principal.onboarded,
+                            }
+                            # Set persona tool context so LLM can update persona
+                            self._persona_tool.set_context(principal.id, factory)
 
             # Set credential + bitget tool contexts (need principal_id + db factory)
             if msg.principal_id:
