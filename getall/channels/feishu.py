@@ -138,15 +138,30 @@ class FeishuChannel(BaseChannel):
                     self.config.verification_token or "",
                     lark.LogLevel.WARNING,
                 )
+                # ── core ──
                 .register_p2_im_message_receive_v1(self._on_message_sync)
+                # ── chat lifecycle ──
                 .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(_noop)
+                .register_p2_im_chat_disbanded_v1(_noop)
+                .register_p2_im_chat_updated_v1(_noop)
+                # ── member changes ──
                 .register_p2_im_chat_member_bot_added_v1(_noop)
                 .register_p2_im_chat_member_bot_deleted_v1(_noop)
                 .register_p2_im_chat_member_user_added_v1(_noop)
+                .register_p2_im_chat_member_user_deleted_v1(_noop)
+                .register_p2_im_chat_member_user_withdrawn_v1(_noop)
+                # ── message events ──
+                .register_p2_im_message_message_read_v1(_noop)
                 .register_p2_im_message_reaction_created_v1(_noop)
                 .register_p2_im_message_reaction_deleted_v1(_noop)
-                .register_p2_im_message_message_read_v1(_noop)
                 .register_p2_im_message_recalled_v1(_noop)
+                # ── events without dedicated SDK handler ──
+                .register_p2_customized_event(
+                    "im.message.at_message_read_v1", _noop
+                )
+                .register_p2_customized_event(
+                    "im.message.updated_v1", _noop
+                )
                 .build()
             )
         return self._event_handler
