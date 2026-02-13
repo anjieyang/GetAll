@@ -13,6 +13,7 @@ import re
 import threading
 import time as _time
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -373,6 +374,59 @@ class FeishuChannel(BaseChannel):
             elements.append({"tag": "markdown", "content": tail})
         return elements or [{"tag": "markdown", "content": content}]
 
+    # ── image upload ──
+
+    def _upload_image_sync(self, file_path: str) -> str | None:
+        """Upload a local image file to Lark, return image_key or None."""
+        from lark_oapi.api.im.v1 import (
+            CreateImageRequest as ImgReq,
+            CreateImageRequestBody as ImgBody,
+        )
+        from pathlib import Path
+
+        p = Path(file_path)
+        if not p.is_file():
+            logger.warning(f"Image file not found: {file_path}")
+            return None
+
+        suffix = p.suffix.lower()
+        if suffix not in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}:
+            return None
+
+        try:
+            with open(p, "rb") as f:
+                req = (
+                    ImgReq.builder()
+                    .request_body(
+                        ImgBody.builder()
+                        .image_type("message")
+                        .image(f)
+                        .build()
+                    )
+                    .build()
+                )
+                resp = self._client.im.v1.image.create(req)
+
+            if resp.success() and resp.data and resp.data.image_key:
+                logger.debug(f"Uploaded image: {p.name} → {resp.data.image_key}")
+                return resp.data.image_key
+            else:
+                logger.warning(
+                    f"Image upload failed: code={resp.code}, msg={resp.msg}"
+                )
+                return None
+        except Exception as exc:
+            logger.warning(f"Error uploading image {file_path}: {exc}")
+            return None
+
+    async def _upload_image(self, file_path: str) -> str | None:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, self._upload_image_sync, file_path
+        )
+
+    # ── outbound (send) ──
+
     async def send(self, msg: OutboundMessage) -> None:
         if not self._client:
             logger.warning("Lark client not initialised")
@@ -394,7 +448,23 @@ class FeishuChannel(BaseChannel):
                         msg.chat_id, sender_oid, content
                     )
 
+            # Build card elements (text + tables)
             elements = self._build_card_elements(content)
+
+            # Upload and embed images from media
+            if msg.media:
+                for path in msg.media:
+                    img_key = await self._upload_image(path)
+                    if img_key:
+                        elements.append({
+                            "tag": "img",
+                            "img_key": img_key,
+                            "alt": {
+                                "tag": "plain_text",
+                                "content": Path(path).stem,
+                            },
+                        })
+
             card = json.dumps(
                 {"config": {"wide_screen_mode": True}, "elements": elements},
                 ensure_ascii=False,
