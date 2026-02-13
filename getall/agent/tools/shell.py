@@ -3,10 +3,16 @@
 import asyncio
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 
 from getall.agent.tools.base import Tool
+
+# Image extensions to scan for after command execution
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
+# Directories to scan for newly generated images
+_SCAN_DIRS = ["/tmp", "/tmp/getall_charts"]
 
 
 class ExecTool(Tool):
@@ -73,6 +79,9 @@ class ExecTool(Tool):
             venv_bin = os.path.join(venv, "bin")
             env["PATH"] = venv_bin + ":" + env.get("PATH", "")
             env["VIRTUAL_ENV"] = venv
+
+        # Snapshot: record existing image files before execution
+        t_before = time.time()
         
         try:
             process = await asyncio.create_subprocess_shell(
@@ -111,11 +120,39 @@ class ExecTool(Tool):
             max_len = 10000
             if len(result) > max_len:
                 result = result[:max_len] + f"\n... (truncated, {len(result) - max_len} more chars)"
+
+            # Scan for newly generated image files
+            new_images = self._scan_new_images(t_before, cwd)
+            if new_images:
+                result += "\n" + "\n".join(
+                    f"[GENERATED_IMAGE:{p}]" for p in new_images
+                )
             
             return result
             
         except Exception as e:
             return f"Error executing command: {str(e)}"
+
+    @staticmethod
+    def _scan_new_images(since: float, cwd: str) -> list[str]:
+        """Find image files created after `since` timestamp."""
+        found: list[str] = []
+        dirs = list(_SCAN_DIRS) + [cwd]
+        seen: set[str] = set()
+        for d in dirs:
+            dp = Path(d)
+            if not dp.is_dir():
+                continue
+            for f in dp.iterdir():
+                if (
+                    f.is_file()
+                    and f.suffix.lower() in _IMAGE_EXTS
+                    and f.stat().st_mtime >= since
+                    and str(f) not in seen
+                ):
+                    found.append(str(f.resolve()))
+                    seen.add(str(f))
+        return found
 
     def _guard_command(self, command: str, cwd: str) -> str | None:
         """Best-effort safety guard for potentially destructive commands."""

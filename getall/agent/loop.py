@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -381,13 +382,33 @@ class AgentLoop:
                 logger.debug("Suppressing final outbound — message tool already sent to this chat")
                 return None
         
+        # Extract generated image paths from tool results in the conversation
+        media = self._extract_generated_images(messages)
+
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
             content=final_content,
+            media=media,
             metadata=msg.metadata or {},  # Pass through for channel-specific needs (e.g. Slack thread_ts)
         )
     
+    _GENERATED_IMAGE_RE = re.compile(r"\[GENERATED_IMAGE:(.*?)\]")
+
+    @classmethod
+    def _extract_generated_images(cls, messages: list[dict[str, Any]]) -> list[str]:
+        """Extract [GENERATED_IMAGE:/path] markers from tool results."""
+        paths: list[str] = []
+        for m in messages:
+            if m.get("role") != "tool":
+                continue
+            content = m.get("content", "")
+            for match in cls._GENERATED_IMAGE_RE.finditer(content):
+                fpath = match.group(1).strip()
+                if Path(fpath).is_file():
+                    paths.append(fpath)
+        return paths
+
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
         Process a system message (e.g., subagent announce).

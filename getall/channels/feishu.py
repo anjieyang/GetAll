@@ -52,6 +52,36 @@ _MSG_TYPE_MAP = {
 _MEMBER_CACHE_TTL = 300  # 5 minutes
 
 
+def _split_into_chunks(text: str) -> list[str]:
+    """Split a response into human-sized message chunks.
+
+    Rules:
+    - If every non-empty line is very short (≤40 chars) and there are ≥3,
+      treat each line as its own chunk (covers counting, lists, sequences).
+    - Otherwise split on paragraph boundaries (double newline).
+    - Single-paragraph responses stay as one message.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return []
+
+    lines = stripped.split("\n")
+    non_empty = [ln for ln in lines if ln.strip()]
+
+    # Heuristic: many short lines → send each as its own message
+    if len(non_empty) >= 3 and all(len(ln.strip()) <= 40 for ln in non_empty):
+        return [ln.strip() for ln in non_empty]
+
+    # Otherwise split on paragraph boundaries
+    paragraphs = re.split(r"\n{2,}", stripped)
+    chunks = [p.strip() for p in paragraphs if p.strip()]
+
+    if len(chunks) <= 1:
+        return [stripped]
+
+    return chunks
+
+
 # ---------------------------------------------------------------------------
 # Group member cache – for @mention resolution
 # ---------------------------------------------------------------------------
@@ -390,8 +420,12 @@ class FeishuChannel(BaseChannel):
 
     # ── image path extraction ──
 
+    # Match: [GENERATED_IMAGE:/path], ![alt](/path), bare /path/to/file.png
+    _GENERATED_TAG_RE = re.compile(r"\[GENERATED_IMAGE:(.*?)\]")
     _IMG_PATH_RE = re.compile(
-        r"(?:!\[.*?\]\()?(/[\w./ -]+\.(?:png|jpg|jpeg|gif|webp|bmp))\)?",
+        r"(?:!\[.*?\]\()?"
+        r"(/[^\s\)\]\"'<>]+\.(?:png|jpg|jpeg|gif|webp|bmp))"
+        r"\)?",
         re.IGNORECASE,
     )
 
@@ -399,12 +433,26 @@ class FeishuChannel(BaseChannel):
         """Extract image file paths from text, return (cleaned_text, paths)."""
         paths: list[str] = []
         cleaned = text
-        for m in self._IMG_PATH_RE.finditer(text):
-            fpath = m.group(1)
-            if Path(fpath).is_file():
+        seen: set[str] = set()
+
+        # 1. [GENERATED_IMAGE:...] tags (highest priority)
+        for m in self._GENERATED_TAG_RE.finditer(text):
+            fpath = m.group(1).strip()
+            if fpath not in seen and Path(fpath).is_file():
                 paths.append(fpath)
-                # Remove the path (and markdown image syntax if present) from text
-                cleaned = cleaned.replace(m.group(0), "").strip()
+                seen.add(fpath)
+            cleaned = cleaned.replace(m.group(0), "")
+
+        # 2. Bare paths / markdown image syntax
+        for m in self._IMG_PATH_RE.finditer(cleaned):
+            fpath = m.group(1)
+            if fpath not in seen and Path(fpath).is_file():
+                paths.append(fpath)
+                seen.add(fpath)
+                cleaned = cleaned.replace(m.group(0), "")
+
+        # Clean up leftover whitespace
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
         return cleaned, paths
 
     # ── image upload ──
@@ -461,6 +509,11 @@ class FeishuChannel(BaseChannel):
     # ── outbound (send) ──
 
     async def send(self, msg: OutboundMessage) -> None:
+        """Send a message through Lark/Feishu.
+
+        Long responses are split into chunks (short lines or paragraphs)
+        and sent one by one with a short delay to feel more human.
+        """
         if not self._client:
             logger.warning("Lark client not initialised")
             return
@@ -472,64 +525,87 @@ class FeishuChannel(BaseChannel):
             content = msg.content
 
             if is_group:
-                # Resolve @name → <at> tags
                 content = self._resolve_at_tags(msg.chat_id, content)
-                # Prepend @sender
-                sender_oid = (msg.metadata or {}).get("sender_open_id", "")
-                if sender_oid:
-                    content = self._prepend_sender_at(
-                        msg.chat_id, sender_oid, content
-                    )
 
             # Collect image paths: from msg.media + extracted from content text
             image_paths: list[str] = list(msg.media or [])
             content, extra_paths = self._extract_image_paths(content)
             image_paths.extend(extra_paths)
 
-            # Build card elements (text + tables)
-            elements = self._build_card_elements(content)
+            # Split into chunks for a more natural conversation feel
+            chunks = _split_into_chunks(content)
 
-            # Upload and embed images
-            for img_path in image_paths:
-                img_key = await self._upload_image(img_path)
-                if img_key:
-                    elements.append({
-                        "tag": "img",
-                        "img_key": img_key,
-                        "alt": {
-                            "tag": "plain_text",
-                            "content": Path(img_path).stem,
-                        },
-                    })
+            for i, chunk in enumerate(chunks):
+                chunk_content = chunk
 
-            card = json.dumps(
-                {"config": {"wide_screen_mode": True}, "elements": elements},
-                ensure_ascii=False,
-            )
+                # Prepend @sender only on the first chunk for group chats
+                if is_group and i == 0:
+                    sender_oid = (msg.metadata or {}).get("sender_open_id", "")
+                    if sender_oid:
+                        chunk_content = self._prepend_sender_at(
+                            msg.chat_id, sender_oid, chunk_content
+                        )
 
-            req = (
-                CreateMessageRequest.builder()
-                .receive_id_type(recv_type)
-                .request_body(
-                    CreateMessageRequestBody.builder()
-                    .receive_id(msg.chat_id)
-                    .msg_type("interactive")
-                    .content(card)
-                    .build()
+                # Build card elements (text + tables)
+                elements = self._build_card_elements(chunk_content)
+
+                # Attach images only to the last chunk
+                if i == len(chunks) - 1:
+                    for img_path in image_paths:
+                        img_key = await self._upload_image(img_path)
+                        if img_key:
+                            elements.append({
+                                "tag": "img",
+                                "img_key": img_key,
+                                "alt": {
+                                    "tag": "plain_text",
+                                    "content": Path(img_path).stem,
+                                },
+                            })
+
+                card = json.dumps(
+                    {"config": {"wide_screen_mode": True}, "elements": elements},
+                    ensure_ascii=False,
                 )
-                .build()
-            )
-            resp = self._client.im.v1.message.create(req)
 
-            if not resp.success():
-                logger.error(
-                    f"Send failed: code={resp.code}, msg={resp.msg}, "
-                    f"log_id={resp.get_log_id()}"
-                )
-            else:
-                logger.debug(f"Sent to {msg.chat_id}")
+                # Typing delay between chunks to feel human
+                if i > 0:
+                    delay = min(0.3 + len(chunk) * 0.01, 2.0)
+                    await asyncio.sleep(delay)
+
+                await self._send_card(recv_type, msg.chat_id, card)
+
         except Exception as exc:
             logger.error(f"Error sending Lark message: {exc}")
+
+    async def _send_card(
+        self, recv_type: str, recv_id: str, card: str
+    ) -> None:
+        """Send one interactive card to Lark."""
+        req = (
+            CreateMessageRequest.builder()
+            .receive_id_type(recv_type)
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(recv_id)
+                .msg_type("interactive")
+                .content(card)
+                .build()
+            )
+            .build()
+        )
+        loop = asyncio.get_running_loop()
+        resp = await loop.run_in_executor(
+            None, self._client.im.v1.message.create, req
+        )
+
+        if not resp.success():
+            logger.error(
+                f"Send failed: code={resp.code}, msg={resp.msg}, "
+                f"log_id={resp.get_log_id()}"
+            )
+        else:
+            logger.debug(f"Sent to {recv_id}")
 
     # ── inbound (receive) ──
 
