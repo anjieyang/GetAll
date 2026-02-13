@@ -1,0 +1,59 @@
+services:
+  # ── PostgreSQL ──
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-getall123}
+      POSTGRES_DB: getall
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Redis ──
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redisdata:/data
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── GetAll Agent ──
+  getall:
+    build:
+      context: .
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-http://host.docker.internal:7890}
+        HTTPS_PROXY: ${HTTPS_PROXY:-http://host.docker.internal:7890}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      GETALL_DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:-getall123}@postgres:5432/getall
+      GETALL_REDIS_URL: redis://redis:6379/0
+    volumes:
+      - getall-config:/root/.getall
+    ports:
+      - "18790:18790"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:
+  getall-config:

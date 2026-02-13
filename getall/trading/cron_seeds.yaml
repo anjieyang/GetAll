@@ -1,0 +1,79 @@
+# Default Trading Cron Jobs
+# ─────────────────────────────────────
+# Seeded once on first gateway start.
+# After creation, jobs live in ~/.getall/data/cron/jobs.json
+# and can be freely modified by the agent, CLI, or API.
+#
+# To re-seed a deleted job: remove it from jobs.json and restart gateway.
+# To add new seed jobs: add entries here and restart gateway.
+
+jobs:
+  - name: anomaly-scan
+    schedule:
+      kind: every
+      every_seconds: 900
+    delivery: announce
+    message: |
+      Run market anomaly scan:
+      1. Read watchlist from PROFILE.md + current positions from positions.json
+      2. Execute: market_data(action="batch_scan", symbols="<all>", dimensions="oi,funding,long_short,net_position,taker,cvd,liquidations,whale,coin_flow,spot_netflow")
+      3. Apply anomaly-detector skill thresholds → classify as HIGH/MEDIUM/LOW
+      4. Check alerts.json for user-defined rules
+      5. Append ALL findings to memory/trading/anomalies.jsonl
+
+      ## Notification protocol
+      • HIGH/EXTREME → call `message` tool with detailed individual alert
+      • MEDIUM → batch all MEDIUMs into ONE summary, call `message` once
+      • LOW or nothing → finish silently, do NOT call `message`
+
+  - name: position-sync
+    schedule:
+      kind: every
+      every_seconds: 900
+    delivery: announce
+    message: |
+      Sync all positions (WebSocket fallback):
+      1. Execute: portfolio(action="sync_all")
+      2. Compare with cached positions.json — flag discrepancies
+
+      ## Notification protocol
+      • New or closed positions → call `message` with change summary
+      • No changes → finish silently
+
+  - name: news-feed
+    schedule:
+      kind: every
+      every_seconds: 900
+    delivery: announce
+    message: |
+      Fetch latest news and sentiment:
+      1. Read watchlist from PROFILE.md + positions from positions.json
+      2. Execute: news_sentiment(action="batch_coin_sentiment", symbols="<all>", count=5)
+      3. Tool auto-caches snapshots to:
+         - memory/trading/news_cache_latest.json (always overwritten, may be empty)
+         - memory/trading/news_cache_history.jsonl (append log, used for time-window queries)
+         - memory/trading/news_cache_last_non_empty.json (only updates when non-empty)
+
+      ## Notification protocol
+      • Important/breaking news for user's coins → call `message` with news brief
+      • Routine or no relevant news → finish silently
+
+  - name: daily-review
+    schedule:
+      kind: cron
+      expr: "0 22 * * *"
+    delivery: announce
+    message: |
+      Generate today's daily trading review:
+      1. Read trades.jsonl — today's trading activity
+      2. Calculate: trades opened/closed, realized P&L, win rate
+      3. Read anomalies.jsonl — today's anomaly events
+      4. Get today's news recap:
+         - Prefer: news_sentiment(action="recent", symbols="<all>", window_minutes=1440, mode="cache", prefer_non_empty=true)
+         - If needed for full detail: read memory/trading/news_cache_history.jsonl and summarize
+      5. Summarize current position changes
+      6. AI Score review: scored trades vs actual outcomes
+      7. Write report to memory/trading/daily/{YYYY-MM-DD}.md
+
+      ## Notification protocol
+      Daily review is always delivered — call `message` with a concise summary.
