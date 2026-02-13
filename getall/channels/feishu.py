@@ -128,26 +128,25 @@ class FeishuChannel(BaseChannel):
         if not FEISHU_AVAILABLE:
             return None
         if self._event_handler is None:
-            # No-op handlers for events we don't process but must ACK
-            def _noop_bot_entered(data: Any) -> None:
-                logger.debug("Lark event: bot_p2p_chat_entered (ignored)")
-
-            def _noop_bot_added(data: Any) -> None:
-                logger.debug("Lark event: bot_added_to_chat (ignored)")
-
-            def _noop_bot_deleted(data: Any) -> None:
-                logger.debug("Lark event: bot_deleted_from_chat (ignored)")
+            # No-op handler for events we don't process but must ACK
+            def _noop(data: Any) -> None:
+                pass
 
             self._event_handler = (
                 lark.EventDispatcherHandler.builder(
                     self.config.encrypt_key or "",
                     self.config.verification_token or "",
-                    lark.LogLevel.DEBUG,
+                    lark.LogLevel.WARNING,
                 )
                 .register_p2_im_message_receive_v1(self._on_message_sync)
-                .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(_noop_bot_entered)
-                .register_p2_im_chat_member_bot_added_v1(_noop_bot_added)
-                .register_p2_im_chat_member_bot_deleted_v1(_noop_bot_deleted)
+                .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(_noop)
+                .register_p2_im_chat_member_bot_added_v1(_noop)
+                .register_p2_im_chat_member_bot_deleted_v1(_noop)
+                .register_p2_im_chat_member_user_added_v1(_noop)
+                .register_p2_im_message_reaction_created_v1(_noop)
+                .register_p2_im_message_reaction_deleted_v1(_noop)
+                .register_p2_im_message_message_read_v1(_noop)
+                .register_p2_im_message_recalled_v1(_noop)
                 .build()
             )
         return self._event_handler
