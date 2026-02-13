@@ -440,6 +440,32 @@ def gateway(
     
     console.print(f"[green]✓[/green] Heartbeat: every 30m")
     
+    # ── Wire up Lark webhook if feishu channel is in webhook mode ──
+    _feishu_webhook_mode = False
+    feishu_ch = channels.get_channel("feishu")
+    if feishu_ch is not None:
+        from getall.channels.feishu import FeishuChannel
+        if isinstance(feishu_ch, FeishuChannel) and feishu_ch.config.use_webhook:
+            from getall.api.routes.lark_webhook import set_event_handler
+            handler = feishu_ch.get_event_handler()
+            if handler:
+                set_event_handler(handler)
+                _feishu_webhook_mode = True
+                logger.info("Lark webhook handler registered on /lark/event")
+
+    async def _run_http_server(bind_port: int) -> None:
+        """Run the FastAPI HTTP server (for Lark webhook + health)."""
+        import uvicorn
+        from getall.api.app import create_app
+        uvi_config = uvicorn.Config(
+            create_app(),
+            host="0.0.0.0",
+            port=bind_port,
+            log_level="warning",
+        )
+        server = uvicorn.Server(uvi_config)
+        await server.serve()
+
     async def run():
         # Auto-create database tables on startup (idempotent)
         try:
@@ -449,13 +475,17 @@ def gateway(
         except Exception as e:
             logger.warning(f"Database auto-migrate skipped: {e}")
 
+        tasks = [agent.run(), channels.start_all()]
+
+        # Start HTTP server when Lark webhook is enabled
+        if _feishu_webhook_mode:
+            tasks.append(_run_http_server(port))
+            console.print(f"[green]✓[/green] HTTP server on :{port} (Lark webhook)")
+
         try:
             await cron.start()
             await heartbeat.start()
-            await asyncio.gather(
-                agent.run(),
-                channels.start_all(),
-            )
+            await asyncio.gather(*tasks)
         except KeyboardInterrupt:
             console.print("\nShutting down...")
             heartbeat.stop()

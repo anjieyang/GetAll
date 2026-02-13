@@ -115,12 +115,20 @@ def _apply_env_overrides(config: Config) -> None:
     if val := os.environ.get("GETALL_DISCORD_ALLOW_FROM"):
         config.channels.discord.allow_from = [v.strip() for v in val.split(",") if v.strip()]
 
-    # --- Feishu ---
+    # --- Feishu / Lark ---
     if val := os.environ.get("GETALL_FEISHU_APP_ID"):
         config.channels.feishu.app_id = val
         config.channels.feishu.enabled = True
     if val := os.environ.get("GETALL_FEISHU_APP_SECRET"):
         config.channels.feishu.app_secret = val
+    if val := os.environ.get("GETALL_FEISHU_ENCRYPT_KEY"):
+        config.channels.feishu.encrypt_key = val
+    if val := os.environ.get("GETALL_FEISHU_VERIFICATION_TOKEN"):
+        config.channels.feishu.verification_token = val
+    if val := os.environ.get("GETALL_FEISHU_DOMAIN"):
+        config.channels.feishu.domain = val
+    if os.environ.get("GETALL_FEISHU_USE_WEBHOOK", "").lower() in ("1", "true", "yes"):
+        config.channels.feishu.use_webhook = True
 
     # --- DingTalk ---
     if val := os.environ.get("GETALL_DINGTALK_CLIENT_ID"):

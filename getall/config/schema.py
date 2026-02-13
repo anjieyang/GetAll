@@ -23,10 +23,11 @@ class TelegramConfig(BaseModel):
 class FeishuConfig(BaseModel):
     """Feishu/Lark channel configuration using WebSocket long connection."""
     enabled: bool = False
-    app_id: str = ""  # App ID from Feishu Open Platform
-    app_secret: str = ""  # App Secret from Feishu Open Platform
-    encrypt_key: str = ""  # Encrypt Key for event subscription (optional)
-    verification_token: str = ""  # Verification Token for event subscription (optional)
+    app_id: str = ""  # App ID from Feishu/Lark Open Platform
+    app_secret: str = ""  # App Secret from Feishu/Lark Open Platform
+    encrypt_key: str = ""  # Encrypt Key for event subscription
+    verification_token: str = ""  # Verification Token for event subscription
+    domain: str = "feishu"  # "feishu" (open.feishu.cn) or "lark" (open.larksuite.com)
     allow_from: list[str] = Field(default_factory=list)  # Allowed user open_ids
     use_webhook: bool = False  # If true, use HTTP webhook instead of WebSocket
     group_mode: str = "shared"  # "shared" = all group messages use one session

@@ -30,10 +30,12 @@ def create_app() -> FastAPI:
 
     # ── mount routers ──
     from getall.api.routes import health, identity, memory, reminders
+    from getall.api.routes import lark_webhook
 
     app.include_router(health.router)
     app.include_router(identity.router, prefix="/api/v1/identity", tags=["identity"])
     app.include_router(memory.router, prefix="/api/v1/memory", tags=["memory"])
     app.include_router(reminders.router, prefix="/api/v1/reminders", tags=["reminders"])
+    app.include_router(lark_webhook.router, tags=["lark"])
 
     return app
