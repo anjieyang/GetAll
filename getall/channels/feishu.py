@@ -374,6 +374,25 @@ class FeishuChannel(BaseChannel):
             elements.append({"tag": "markdown", "content": tail})
         return elements or [{"tag": "markdown", "content": content}]
 
+    # ── image path extraction ──
+
+    _IMG_PATH_RE = re.compile(
+        r"(?:!\[.*?\]\()?(/[\w./ -]+\.(?:png|jpg|jpeg|gif|webp|bmp))\)?",
+        re.IGNORECASE,
+    )
+
+    def _extract_image_paths(self, text: str) -> tuple[str, list[str]]:
+        """Extract image file paths from text, return (cleaned_text, paths)."""
+        paths: list[str] = []
+        cleaned = text
+        for m in self._IMG_PATH_RE.finditer(text):
+            fpath = m.group(1)
+            if Path(fpath).is_file():
+                paths.append(fpath)
+                # Remove the path (and markdown image syntax if present) from text
+                cleaned = cleaned.replace(m.group(0), "").strip()
+        return cleaned, paths
+
     # ── image upload ──
 
     def _upload_image_sync(self, file_path: str) -> str | None:
@@ -448,22 +467,26 @@ class FeishuChannel(BaseChannel):
                         msg.chat_id, sender_oid, content
                     )
 
+            # Collect image paths: from msg.media + extracted from content text
+            image_paths: list[str] = list(msg.media or [])
+            content, extra_paths = self._extract_image_paths(content)
+            image_paths.extend(extra_paths)
+
             # Build card elements (text + tables)
             elements = self._build_card_elements(content)
 
-            # Upload and embed images from media
-            if msg.media:
-                for path in msg.media:
-                    img_key = await self._upload_image(path)
-                    if img_key:
-                        elements.append({
-                            "tag": "img",
-                            "img_key": img_key,
-                            "alt": {
-                                "tag": "plain_text",
-                                "content": Path(path).stem,
-                            },
-                        })
+            # Upload and embed images
+            for img_path in image_paths:
+                img_key = await self._upload_image(img_path)
+                if img_key:
+                    elements.append({
+                        "tag": "img",
+                        "img_key": img_key,
+                        "alt": {
+                            "tag": "plain_text",
+                            "content": Path(img_path).stem,
+                        },
+                    })
 
             card = json.dumps(
                 {"config": {"wide_screen_mode": True}, "elements": elements},

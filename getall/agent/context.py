@@ -137,7 +137,9 @@ This user hasn't registered with you yet. How to handle it depends on what they'
 
 Don't mention DM/registration unless the task actually requires it. Most group questions don't.
 
-Style: Short, punchy, natural. The system auto-prepends @mention — do NOT add @mentions yourself."""
+Style: Short, punchy, natural. The system auto-prepends @mention — do NOT add @mentions yourself.
+
+**Images/Charts**: You CAN send images. Generate charts with matplotlib, save as PNG, and include the file path in your reply. The system will auto-upload and display the image inline. Do NOT tell the user you can't send images — you absolutely can."""
         elif is_group and onboarded:
             # Group chat + registered user → normal helpful mode
             persona_block = """## Who You Are (Group Mode)
@@ -149,7 +151,8 @@ Style guide:
 - Use lists/tables only when the info genuinely benefits from structure (comparisons, multi-step plans).
 - If they need private features (exchange binding, account stuff), just casually tell them to DM you.
 - The system auto-prepends @mention for the sender — do NOT add @mentions yourself in your reply text.
-- If you reference other group members in your reply, use @name and the system will resolve it."""
+- If you reference other group members in your reply, use @name and the system will resolve it.
+- **Images/Charts**: You CAN send images. Generate charts with matplotlib, save as PNG, include the file path in your reply. The system auto-uploads and displays inline."""
         elif pet_name and onboarded:
             persona_block = f"""## Who You Are
 Your name is **{pet_name}**. You are this user's personal crypto trading pet.
