@@ -127,12 +127,26 @@ class FeishuChannel(BaseChannel):
         if not FEISHU_AVAILABLE:
             return None
         if self._event_handler is None:
+            # No-op handlers for events we don't process but must ACK
+            def _noop_bot_entered(data: Any) -> None:
+                logger.debug("Lark event: bot_p2p_chat_entered (ignored)")
+
+            def _noop_bot_added(data: Any) -> None:
+                logger.debug("Lark event: bot_added_to_chat (ignored)")
+
+            def _noop_bot_deleted(data: Any) -> None:
+                logger.debug("Lark event: bot_deleted_from_chat (ignored)")
+
             self._event_handler = (
                 lark.EventDispatcherHandler.builder(
                     self.config.encrypt_key or "",
                     self.config.verification_token or "",
+                    lark.LogLevel.DEBUG,
                 )
                 .register_p2_im_message_receive_v1(self._on_message_sync)
+                .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(_noop_bot_entered)
+                .register_p2_im_chat_member_bot_added_v1(_noop_bot_added)
+                .register_p2_im_chat_member_bot_deleted_v1(_noop_bot_deleted)
                 .build()
             )
         return self._event_handler
@@ -442,9 +456,6 @@ class FeishuChannel(BaseChannel):
             chat_type = message.chat_type  # "p2p" | "group"
             msg_type = message.message_type
 
-            # Seen indicator
-            await self._add_reaction(mid, "THUMBSUP")
-
             # ── parse content ──
             content = ""
             sender_name = sender_id
@@ -515,10 +526,35 @@ class FeishuChannel(BaseChannel):
             if not content:
                 return
 
-            # ── group member cache ──
+            # ── group: only respond when bot is @mentioned ──
             if chat_type == "group":
+                bot_was_mentioned = False
+                if message.mentions:
+                    for mention in message.mentions:
+                        oid = mention.id.open_id if mention.id else ""
+                        if self._bot_open_id and oid == self._bot_open_id:
+                            bot_was_mentioned = True
+                            break
+                        # Before we know bot_open_id, check if mention
+                        # is a non-sender, non-member (likely the bot)
+                        if (
+                            not self._bot_open_id
+                            and oid
+                            and oid != sender_id
+                        ):
+                            bot_was_mentioned = True
+                            break
+
+                if not bot_was_mentioned:
+                    # Still track sender for member cache, but don't respond
+                    self._members.track_sender(chat_id, sender_id, sender_name)
+                    return
+
                 self._members.track_sender(chat_id, sender_id, sender_name)
                 asyncio.create_task(self._ensure_members(chat_id))
+
+            # Seen indicator (only for messages we'll respond to)
+            await self._add_reaction(mid, "THUMBSUP")
 
             # ── forward to bus ──
             reply_to = chat_id if chat_type == "group" else sender_id

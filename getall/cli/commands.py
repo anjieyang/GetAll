@@ -449,7 +449,7 @@ def gateway(
             from getall.api.routes.lark_webhook import set_event_handler
             handler = feishu_ch.get_event_handler()
             if handler:
-                set_event_handler(handler)
+                set_event_handler(handler, encrypt_key=feishu_ch.config.encrypt_key)
                 _feishu_webhook_mode = True
                 logger.info("Lark webhook handler registered on /lark/event")
 
