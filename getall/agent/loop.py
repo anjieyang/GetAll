@@ -34,36 +34,41 @@ from getall.agent.tools.bitget import (
     BitgetTradeTool,
     BitgetUtaTool,
 )
+from getall.agent.tools.coingecko import CoinGeckoTool
 from getall.agent.tools.credential import CredentialTool
+from getall.agent.tools.defillama import DefiLlamaTool
+from getall.agent.tools.fear_greed import FearGreedTool
+from getall.agent.tools.finnhub import FinnhubTool
+from getall.agent.tools.freecrypto import FreeCryptoTool
+from getall.agent.tools.group_stats import GroupStatsTool
 from getall.agent.tools.persona import PetPersonaTool
+from getall.agent.tools.yfinance_tool import YFinanceTool
 from getall.trading.data.hub import DataHub
-from getall.trading.tools.backtest import BacktestTool
 from getall.agent.memory import MemoryStore
 from getall.agent.subagent import SubagentManager
-from getall.session.manager import SessionManager, save_handoff, consume_handoff
+from getall.session.manager import Session, SessionManager, save_handoff, consume_handoff
 
 # ── Voice mode triggers (substring match) ──
 # System prompt — voice capability section (always injected).
 _VOICE_SECTION_TEMPLATE = """\n
 ## Voice Capability
 
-You have built-in voice (TTS/STT). Current voice mode: **{mode}**.
+You have built-in voice (TTS/STT). Default mode: **text (图文)**.
 
 ### How mode works
+- **Default is text**: Always reply with normal text unless the user explicitly asks for voice.
 - **voice mode ON**: Your text reply is automatically converted to speech audio and sent as a voice message.
-- **voice mode OFF**: Normal text replies.
-- When the user sends a voice message, voice mode is auto-enabled.
+- Even if the user sends a voice message, reply with text unless they explicitly say they want a voice reply.
 
-### You control the mode
-Use your judgment to decide when to switch. Add one of these tags in your reply:
-- `[[voice:on]]` — switch to voice mode (going forward)
-- `[[voice:off]]` — switch back to text mode (going forward)
-- `[[voice:coral]]` — switch to voice mode with a specific voice
+### You control the mode — per-reply only (not sticky)
+Add one of these tags in your reply to enable voice **for this reply only**:
+- `[[voice:on]]` — reply with voice this time
+- `[[voice:coral]]` — reply with voice using a specific voice
 - `[[voice:cedar instructions=用温柔的语气]]` — voice + style control
 
-**When to switch ON**: user asks to "用语音回复", "speak to me", sends audio, or any indication they want voice.
-**When to switch OFF**: user asks to "用文字", "别发语音", "text please", or any indication they prefer text.
-**Use your intelligence** — don't pattern-match keywords; understand the user's intent from context.
+**When to use voice**: ONLY when the user explicitly requests voice reply, e.g. "用语音回复", "语音说", "speak to me", "用语音和我说".
+**Otherwise**: Always use text. Do NOT enable voice just because the user sent a voice message.
+**Use your intelligence** — understand the user's intent from context, not keyword matching.
 
 {voice_active_section}
 {voice_options}
@@ -245,16 +250,41 @@ class AgentLoop:
         self._persona_tool = PetPersonaTool()
         self.tools.register(self._persona_tool)
 
-        # Backtest tool (VectorBT engine)
+        # Group chat statistics tool
+        self._group_stats_tool = GroupStatsTool()
+        self.tools.register(self._group_stats_tool)
+
+        # Trading domain tools (all depend on DataHub, lazy-imported to avoid circular imports)
         try:
+            from getall.trading.tools.backtest import BacktestTool
+            from getall.trading.tools.market_data import MarketDataTool
+            from getall.trading.tools.news_sentiment import NewsSentimentTool
+            from getall.trading.tools.technical_analysis import TechnicalAnalysisTool
+            from getall.trading.tools.portfolio import PortfolioTool
+            from getall.trading.tools.trade import TradeTool
+
             self._trading_hub = DataHub(self.trading_config, self.workspace)
-            self._backtest_tool = BacktestTool(
-                hub=self._trading_hub,
-                workspace=self.workspace,
-            )
-            self.tools.register(self._backtest_tool)
+            self.tools.register(BacktestTool(hub=self._trading_hub, workspace=self.workspace))
+            self.tools.register(MarketDataTool(hub=self._trading_hub))
+            self.tools.register(NewsSentimentTool(hub=self._trading_hub, workspace_path=self.workspace))
+            self.tools.register(TechnicalAnalysisTool(hub=self._trading_hub))
+            self.tools.register(PortfolioTool(hub=self._trading_hub, workspace_path=self.workspace))
+            self.tools.register(TradeTool(hub=self._trading_hub))
         except Exception as e:
-            logger.warning(f"Backtest tool disabled: {e}")
+            logger.warning(f"Trading tools disabled: {e}")
+
+        # Multi-source market data tools (no DataHub dependency)
+        import os
+        self.tools.register(CoinGeckoTool(api_key=os.environ.get("COINGECKO_API_KEY", "")))
+        self.tools.register(YFinanceTool())
+
+        # DeFi & sentiment tools (free, no API key)
+        self.tools.register(DefiLlamaTool())
+        self.tools.register(FearGreedTool())
+
+        # Financial data tools (API key required)
+        self.tools.register(FinnhubTool(api_key=os.environ.get("FINNHUB_API_KEY", "")))
+        self.tools.register(FreeCryptoTool(api_key=os.environ.get("FREECRYPTO_API_KEY", "")))
     
     @staticmethod
     def _resolve_system_origin(chat_id: str) -> tuple[str, str]:
@@ -475,6 +505,34 @@ Current trigger: ambient_listener
 - If replying would create noise (side chat, casual banter, emoji-only, no real ask), output EXACTLY: [NO_REPLY]
 - For ambient listening (not mentioned), stay restrained. If uncertain, choose [NO_REPLY]."""
     
+    # ── tool timing injection ──
+
+    @staticmethod
+    def _inject_tool_timings(
+        session: "Session",
+        messages: list[dict[str, Any]],
+    ) -> None:
+        """Inject recent tool execution timings into system prompt.
+
+        This lets the agent estimate how long similar tasks will take and
+        decide whether to set task-scoped heartbeat reminders.
+        """
+        timings: list[dict[str, Any]] = session.metadata.get("tool_timings", [])
+        if not timings or not messages or messages[0].get("role") != "system":
+            return
+        # Only show tools that took >= 2s (meaningful for duration estimation)
+        significant = [t for t in timings if t.get("elapsed_seconds", 0) >= 2.0]
+        if not significant:
+            return
+        lines = [
+            f"- {t['tool']}({t.get('args_summary', '')[:80]}): {t['elapsed_seconds']}s"
+            for t in significant[-10:]
+        ]
+        messages[0]["content"] += (
+            "\n\n## Recent Tool Execution Times (reference for estimating task duration)\n"
+            + "\n".join(lines)
+        )
+
     # ── voice mode helpers ──
 
     async def _transcribe_audio(self, msg: InboundMessage) -> str:
@@ -571,13 +629,8 @@ Current trigger: ambient_listener
         # Get or create session
         session = self.sessions.get_or_create(session_key or msg.session_key)
 
-        # ── Voice mode management ──
-        # Auto-enable voice mode when user sends audio (objective detection).
-        if is_audio_msg:
-            session.metadata["voice_mode"] = True
-            logger.info("Voice mode auto-enabled (user sent audio)")
-        # NOTE: text-based on/off is NOT keyword-matched here.
-        # The agent decides and emits [[voice:on]]/[[voice:off]] in its reply.
+        # ── Voice mode: default OFF ──
+        # Voice replies only when the agent emits [[voice:on]] (user explicitly asked).
 
         # ── Cross-chat handoff injection ──
         # If the agent proactively DM'd this user from a group chat earlier,
@@ -612,6 +665,9 @@ Current trigger: ambient_listener
         reminders_tool = self.tools.get("reminders")
         if isinstance(reminders_tool, ReminderTool):
             reminders_tool.set_context(msg.channel, msg.chat_id)
+
+        # Group stats tool context
+        self._group_stats_tool.set_context(msg.chat_id or "", msg.chat_type or "")
 
         # ── Identity resolution: ensure every message has a principal_id ──
         persona: dict[str, Any] | None = None
@@ -743,7 +799,7 @@ Current trigger: ambient_listener
         )
 
         # Inject voice capability section into system prompt (always).
-        voice_mode_active = session.metadata.get("voice_mode", False)
+        voice_mode_active = False  # default OFF; agent enables via [[voice:on]] when user explicitly asks
         if self.voice.available and messages and messages[0].get("role") == "system":
             mode_label = "ON" if voice_mode_active else "OFF"
             voice_section = _VOICE_SECTION_TEMPLATE.format(
@@ -764,7 +820,49 @@ Current trigger: ambient_listener
             )
             logger.debug(f"Injected {len(group_members)} group members into context: {names}")
         self._inject_group_reply_policy(msg, messages)
+
+        # ── Inject tool execution timing history for duration estimation ──
+        self._inject_tool_timings(session, messages)
         
+        # ── Task-scoped heartbeat infrastructure ──
+        # Background tasks that fire progress messages after a delay.
+        # All auto-cancelled when processing completes.
+        _heartbeat_tasks: dict[str, asyncio.Task[None]] = {}
+        _heartbeat_counter = 0
+
+        async def _fire_heartbeat(delay: float, content: str) -> None:
+            """Background coroutine: sleep then send a progress message."""
+            try:
+                await asyncio.sleep(delay)
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=content,
+                    metadata=msg.metadata or {},
+                ))
+                logger.info(f"Heartbeat fired: {content[:60]}")
+            except asyncio.CancelledError:
+                pass
+
+        def _register_heartbeat(delay_seconds: int, message: str) -> str:
+            nonlocal _heartbeat_counter
+            _heartbeat_counter += 1
+            hb_id = f"hb_{_heartbeat_counter}"
+            task = asyncio.create_task(_fire_heartbeat(delay_seconds, message))
+            _heartbeat_tasks[hb_id] = task
+            return hb_id
+
+        def _cancel_heartbeat(hb_id: str) -> bool:
+            task = _heartbeat_tasks.get(hb_id)
+            if task and not task.done():
+                task.cancel()
+                return True
+            return False
+
+        # Wire heartbeat callbacks into the reminder tool
+        if isinstance(reminders_tool, ReminderTool):
+            reminders_tool.set_heartbeat_callbacks(_register_heartbeat, _cancel_heartbeat)
+
         # Agent loop
         iteration = 0
         final_content = None
@@ -791,6 +889,20 @@ Current trigger: ambient_listener
 
             # Handle tool calls
             if response.has_tool_calls:
+                # ── Intermediate text: send LLM's accompanying text to user ──
+                # When the LLM says something alongside tool calls (e.g.
+                # "让我来查一下…") we deliver it immediately so the user
+                # sees natural, human-like progress rather than silence.
+                intermediate_text = (response.content or "").strip()
+                if intermediate_text and not self._is_no_reply(intermediate_text):
+                    await self.bus.publish_outbound(OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content=intermediate_text,
+                        metadata=msg.metadata or {},
+                    ))
+                    logger.info(f"Sent intermediate text: {intermediate_text[:80]}")
+
                 # Add assistant message with tool calls
                 tool_call_dicts = [
                     {
@@ -808,12 +920,32 @@ Current trigger: ambient_listener
                     reasoning_content=response.reasoning_content,
                 )
                 
-                # Execute tools
+                # Execute tools (with timing for duration estimation)
                 for tool_call in response.tool_calls:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
+                    t0 = asyncio.get_event_loop().time()
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    elapsed = round(asyncio.get_event_loop().time() - t0, 1)
+                    if elapsed >= 1.0:
+                        logger.info(f"Tool {tool_call.name} took {elapsed}s")
+                    # Record execution time for agent estimation
+                    session.add_tool_execution(
+                        tool_call.name,
+                        tool_call.arguments,
+                        result[:200] if result else "",
+                    )
+                    session.metadata.setdefault("tool_timings", []).append({
+                        "tool": tool_call.name,
+                        "args_summary": args_str[:120],
+                        "elapsed_seconds": elapsed,
+                    })
+                    # Keep only recent timings
+                    timings = session.metadata["tool_timings"]
+                    if len(timings) > 50:
+                        session.metadata["tool_timings"] = timings[-50:]
+
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -855,6 +987,15 @@ Current trigger: ambient_listener
             if not final_content:
                 final_content = "处理完成，但未能生成最终回复，请再试一次。"
 
+        # ── Cancel all pending heartbeats (task completed) ──
+        for hb_id, task in _heartbeat_tasks.items():
+            if not task.done():
+                task.cancel()
+                logger.debug(f"Heartbeat {hb_id} auto-cancelled (task complete)")
+        _heartbeat_tasks.clear()
+        if isinstance(reminders_tool, ReminderTool):
+            reminders_tool.clear_heartbeat_callbacks()
+
         metadata = msg.metadata or {}
         strong_trigger = bool(metadata.get("bot_was_mentioned"))
         if is_group and strong_trigger and self._is_no_reply(final_content):
@@ -872,17 +1013,15 @@ Current trigger: ambient_listener
                 f"{msg.channel}:{msg.chat_id}"
             )
 
-        # Parse [[voice:...]] directive — always, since agent may switch mode.
+        # Parse [[voice:...]] directive — strip from text; apply to this reply only.
         _voice_directive = None
         if final_content:
             final_content, _voice_directive = parse_voice_directive(final_content)
-            # Apply mode switch from agent's directive.
             if _voice_directive and _voice_directive.mode_switch:
                 new_mode = _voice_directive.mode_switch == "on"
                 if new_mode != voice_mode_active:
-                    session.metadata["voice_mode"] = new_mode
                     voice_mode_active = new_mode
-                    logger.info(f"Voice mode {'ON' if new_mode else 'OFF'} (agent directive)")
+                    logger.info(f"Voice mode {'ON' if new_mode else 'OFF'} (agent directive, this reply only)")
 
         # Log response preview
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
@@ -1095,6 +1234,57 @@ Current trigger: ambient_listener
             content=final_content
         )
     
+    @staticmethod
+    def _extract_consolidation_json(raw: str) -> dict[str, str]:
+        """Best-effort extraction of {history_entry, memory_update} from LLM text.
+
+        Strategies (in order):
+        1. Direct json.loads after stripping markdown fences.
+        2. Find the first '{' … last '}' substring and parse.
+        3. Regex extraction of each field individually.
+        """
+        import json as _json
+
+        def _try_parse(text: str) -> dict[str, str] | None:
+            try:
+                obj = _json.loads(text)
+                if isinstance(obj, dict):
+                    return obj
+            except (ValueError, TypeError):
+                return None
+
+        # Strategy 1: strip markdown fences
+        text = raw.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        result = _try_parse(text)
+        if result is not None:
+            return result
+
+        # Strategy 2: find outermost braces
+        first = text.find("{")
+        last = text.rfind("}")
+        if first != -1 and last > first:
+            result = _try_parse(text[first : last + 1])
+            if result is not None:
+                return result
+
+        # Strategy 3: regex extraction per field
+        extracted: dict[str, str] = {}
+        for key in ("history_entry", "memory_update"):
+            m = re.search(
+                rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"',
+                text,
+                re.DOTALL,
+            )
+            if m:
+                extracted[key] = m.group(1).replace('\\"', '"').replace("\\n", "\n")
+        if extracted:
+            logger.debug(f"Memory consolidation: used regex fallback, extracted keys: {list(extracted)}")
+            return extracted
+
+        raise ValueError(f"Could not extract JSON from LLM response ({len(raw)} chars)")
+
     async def _consolidate_memory(self, session) -> None:
         """Consolidate old messages into MEMORY.md + HISTORY.md, then trim session."""
         memory_scope = str(session.metadata.get("memory_scope") or "global")
@@ -1153,10 +1343,7 @@ Respond with ONLY valid JSON, no markdown fences."""
             )
             import json as _json
             text = (response.content or "").strip()
-            # Strip markdown fences that LLMs often add despite instructions
-            if text.startswith("```"):
-                text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-            result = _json.loads(text)
+            result = self._extract_consolidation_json(text)
 
             if entry := result.get("history_entry"):
                 memory.append_history(entry)
@@ -1164,12 +1351,14 @@ Respond with ONLY valid JSON, no markdown fences."""
                 if update != current_memory:
                     memory.write_long_term(update)
 
-            # Trim session to recent messages
-            session.messages = session.messages[-keep_count:]
-            self.sessions.save(session)
-            logger.info(f"Memory consolidation done, session trimmed to {len(session.messages)} messages")
+            logger.info(f"Memory consolidation done, session trimmed to {len(session.messages)} → {keep_count}")
         except Exception as e:
             logger.error(f"Memory consolidation failed: {e}")
+        finally:
+            # Always trim session to prevent unbounded growth,
+            # even when consolidation fails.
+            session.messages = session.messages[-keep_count:]
+            self.sessions.save(session)
 
     async def process_direct(
         self,
