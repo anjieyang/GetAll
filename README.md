@@ -6,7 +6,7 @@
   </p>
 </div>
 
-**GetAll** is an AI-native crypto trading assistant built on top of the [nanobot](https://github.com/HKUDS/nanobot) framework, deeply integrated with the **Bitget** exchange.
+**GetAll** is an AI-native crypto trading assistant deeply integrated with the **Bitget** exchange.
 
 - Real-time market data, portfolio tracking, and trade execution via Bitget API
 - Natural language trading commands ("帮我开多 BTC 100U 20x")
