@@ -1,6 +1,6 @@
 ---
 name: quick-trade
-description: "Fast trade execution from natural language. Handles spot and futures orders with automatic parameter inference."
+description: "Fast trade execution from natural language. Handles spot and futures orders with automatic parameter inference. Use when user says '买/卖/做多/做空/开多/开空/long/short', gives a trading command like '帮我买2000U的BTC', or wants to place an order quickly."
 metadata: '{"getall":{"always":false,"emoji":"⚡"}}'
 ---
 

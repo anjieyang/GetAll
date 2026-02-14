@@ -1,182 +1,125 @@
 ---
 name: backtest-runner
-description: "Backtesting with Nautilus Trader. Run historical simulations of trading strategies via the `backtest` tool, generate performance reports with win rate, Sharpe ratio, drawdown, and profit factor."
+description: "Run and interpret strategy backtests. Use when user says 'backtest', 'validate strategy', 'test this strategy historically', 'run backtest', or after creating a strategy via strategy-builder."
 metadata: '{"getall":{"always":false}}'
 ---
 
-# Backtest Runner — Strategy Validation via `backtest` Tool
+# Backtest Runner — Strategy Validation Workflow
 
-Execute rigorous historical backtests for any trading strategy using the `backtest` tool. Supports both JSON-configured template strategies (80% of cases) and custom `.py` strategy files (complex scenarios).
+You have a `backtest` tool that returns **structured JSON metrics + a professional dashboard chart**. Your job is to interpret the data into actionable insight. Never dump raw JSON. Never draw your own charts — the tool generates a professional dashboard automatically.
 
-## When to Use
+## Hard Rules
 
-- User says "backtest this strategy", "validate this strategy historically"
-- After creating a new strategy (suggested by strategy-builder)
-- User wants to compare strategy variants
-- Periodic strategy health check (actual vs backtest performance)
-
-## Quick Start
-
-### Simple Strategy (JSON config → `run_backtest`)
-
-For most strategies, use the `backtest` tool directly with a JSON configuration:
-
-```
-backtest(
-  action="run_backtest",
-  strategy_config='{
-    "name": "rsi_oversold_bounce",
-    "symbols": ["BTC/USDT"],
-    "timeframe": "4h",
-    "indicators": [
-      {"name": "rsi", "params": {"period": 14}},
-      {"name": "ema", "key": "ema_21", "params": {"period": 21}}
-    ],
-    "entry_conditions": [
-      {"indicator": "rsi", "field": "value", "operator": "lt", "value": 30},
-      {"indicator": "ema_21", "field": "value", "operator": "lt", "value": "close"}
-    ],
-    "exit_conditions": [
-      {"indicator": "rsi", "field": "value", "operator": "gt", "value": 70}
-    ],
-    "direction": "long",
-    "stop_loss_pct": 5,
-    "take_profit_pct": 15,
-    "leverage": 1
-  }',
-  period="6m"
-)
-```
-
-### Complex Strategy (custom `.py` file → `run_custom`)
-
-When the strategy requires custom factor computation, multi-asset correlation, or on-chain data:
-
-1. **Write the strategy file** using `write_file` tool:
-
-```python
-# workspace/strategies/my_strat/strategy.py
-from nautilus_trader.trading.strategy import Strategy, StrategyConfig
-from nautilus_trader.indicators import RelativeStrengthIndex as RSI
-from nautilus_trader.model import Bar, OrderSide, Quantity
-
-class MyConfig(StrategyConfig):
-    instrument_id: str = ""
-    trade_size: int = 100_000
-
-class MyStrategy(Strategy):
-    def __init__(self, config: MyConfig):
-        super().__init__(config=config)
-        self.rsi = RSI(14)
-
-    def on_start(self):
-        self.subscribe_bars(...)
-
-    def on_bar(self, bar: Bar):
-        self.rsi.handle_bar(bar)
-        if self.rsi.initialized and self.rsi.value < 30:
-            order = self.order_factory.market(...)
-            self.submit_order(order)
-```
-
-2. **Run backtest**:
-
-```
-backtest(
-  action="run_custom",
-  strategy_file="workspace/strategies/my_strat/strategy.py",
-  strategy_config='{"symbols": ["BTC/USDT"], "timeframe": "4h"}',
-  period="6m"
-)
-```
+1. **ALWAYS use the `backtest` tool** — never `exec` with matplotlib, never install external frameworks
+2. **ALWAYS send the chart** — if `chart_path` exists, include it via `message(media=[chart_path])`. Never ask "want to see the chart?"
+3. **ALWAYS lead with a verdict** — first sentence must be a clear pass/fail judgment
+4. **ALWAYS compare vs benchmark** — use `benchmark_return_pct` and `excess_return_pct`
+5. **ALWAYS end with one actionable suggestion** — what to try next
 
 ## Workflow
 
-### Step 1: Parse the Strategy
+### Step 1: Parse Strategy → Build Config
 
-Read the strategy source (STRATEGY.md file or user description) and extract:
+Extract from user description or STRATEGY.md and build a JSON config:
 
-| Parameter | Source | Example |
-|-----------|--------|---------|
-| Entry conditions | Strategy entry rules | RSI(14) < 30 AND volume > 2x avg |
-| Exit conditions | Strategy exit rules | RSI > 60 OR price +8% OR SL -5% |
-| Symbols | Strategy `symbols` field | [BTC/USDT, ETH/USDT] |
-| Timeframe | Strategy `timeframe` field | 4h |
-| Position sizing | Strategy `risk` section | 3% per trade, max 3x leverage |
-| Stop-loss | Strategy exit rules | -5% from entry |
-| Take-profit | Strategy exit rules | +15% from entry or RSI > 60 |
-
-If any critical parameter is missing, ask the user before proceeding.
-
-### Step 2: Build the JSON Strategy Config
-
-Map the strategy to a JSON configuration for the `backtest` tool:
-
-**Condition operators:**
-- `lt` (less than), `gt` (greater than), `lte`, `gte`, `eq`
-- `cross_above` (golden cross), `cross_below` (death cross)
-
-**Indicator field references:**
-- Simple: `{"indicator": "rsi", "field": "value", "operator": "lt", "value": 30}`
-- Cross-reference: `{"indicator": "macd", "field": "value", "operator": "cross_above", "value": "macd.signal"}`
-
-### Step 3: Call the `backtest` Tool
-
-```
-backtest(action="run_backtest", strategy_config='{...}', period="6m")
+```json
+{
+  "name": "strategy_name",
+  "symbols": ["BTC/USDT"],
+  "timeframe": "4h",
+  "indicators": [{"name": "rsi", "params": {"period": 14}}],
+  "entry_conditions": [{"indicator": "rsi", "field": "value", "operator": "lt", "value": 30}],
+  "exit_conditions": [{"indicator": "rsi", "field": "value", "operator": "gt", "value": 70}],
+  "direction": "long",
+  "stop_loss_pct": 5,
+  "take_profit_pct": 15,
+  "trade_size_pct": 100
+}
 ```
 
-### Step 4: Interpret Results and Report
+If critical info is missing, ask **one** clarifying question. Otherwise, fill reasonable defaults.
 
-The tool returns a formatted report. Provide your assessment:
-- Win rate > 55% and profit factor > 1.5 → "Looks promising"
-- Win rate < 40% or profit factor < 1.0 → "Needs improvement"
-- Max drawdown > 20% → "High drawdown risk, consider tighter stops"
-- Total trades < 20 → "Low sample size, results may not be significant"
+### Step 2: Call the Tool
 
-### Step 5: Update Strategy File
-
-If the strategy has a STRATEGY.md file, update the `backtest:` section:
-
-```yaml
-backtest:
-  engine: "nautilus_trader"
-  period: "{start} ~ {end}"
-  win_rate: {rate}
-  profit_factor: {pf}
-  max_drawdown: "{dd}%"
-  sharpe_ratio: {sharpe}
-  total_trades: {n}
+```
+backtest(action="run", strategy_config='{ ... }', period="6m", exchange="binance")
 ```
 
-## Available Indicators Reference
+### Step 3: Interpret — Follow This Report Structure
 
-### Nautilus Trader Built-in (use directly in strategy)
+Your text response MUST follow this structure (adapt wording to context):
 
-| Category | Indicators | Default Params |
-|----------|-----------|----------------|
-| **Moving Averages** | sma, ema, dema, hma, wma, vwap | period=20 |
-| **Momentum** | rsi, macd, bollinger, cci, stoch, roc, aroon | varies |
-| **Volatility** | atr, donchian, keltner | period=14-20 |
-| **Ratio** | efficiency_ratio | period=10 |
-| **Order Book** | book_imbalance_ratio | — |
+```
+📊 [Strategy Name] 回测结果 ([period] / [timeframe] / [symbols])
 
-### pandas-ta Extended (pre-compute, feed as custom data)
+[VERDICT EMOJI] 结论: [one-sentence pass/fail judgment with key number]
 
-130+ additional indicators including: Ichimoku Cloud, SuperTrend, VWMA, OBV, MFI, ADX, Williams %R, Chaikin, Fisher Transform, Squeeze, KAMA, TRIX, PPO, Vortex, etc.
+┌─────────────┬──────────┬──────────┐
+│ 指标        │ 策略     │ 基准     │
+├─────────────┼──────────┼──────────┤
+│ 总收益      │ X%       │ Y%       │
+│ 年化收益    │ X%       │ -        │
+│ 最大回撤    │ X%       │ -        │
+│ Sharpe      │ X        │ -        │
+│ 胜率        │ X%       │ -        │
+│ 盈亏比      │ X        │ -        │
+│ Profit Factor│ X       │ -        │
+│ 交易次数    │ X        │ -        │
+└─────────────┴──────────┴──────────┘
 
-### Decision Rule
+[WARNINGS if any — see quality flags below]
 
-- **Indicator exists in Nautilus** → use native (faster, event-driven, use in strategy JSON config)
-- **Not in Nautilus** → pre-compute with `technical_analysis` tool or pandas-ta, then write custom `.py`
-- **Complex composite factors** → Agent writes Python code to pre-compute, saves to workspace, then uses in custom strategy
+💡 建议: [one concrete, actionable next step]
+```
 
-Use `backtest(action="list_indicators")` to see the full list with default parameters.
+Verdict emojis:
+- 🟢 Strategy looks promising (PF > 1.5, excess return > 0, Sharpe > 1.0)
+- 🟡 Mixed results, needs refinement (PF 1.0-1.5, or weak Sharpe)
+- 🔴 Strategy fails (PF < 1.0, or negative excess return, or DD > 25%)
 
-## Quality Guidelines
+### Step 4: Send Chart + Text Together
 
-- **Minimum sample size**: Warn if total trades < 20 — results may not be statistically significant
-- **Overfitting risk**: If win rate > 80%, warn that the strategy may be overfit to historical data
-- **Market regime**: Note if the backtest period was predominantly bull/bear/range — results may differ in other regimes
-- **Suggest out-of-sample testing**: backtest on 70% of data, validate on remaining 30%
-- **Multiple timeframes**: Consider running the same strategy on different periods to check robustness
+```
+message(content="[your analysis text above]", media=["[chart_path from metrics]"])
+```
+
+The dashboard chart has 4 panels: equity+benchmark, drawdown, monthly heatmap, metrics box. It speaks for itself — your text adds the *judgment* and *suggestion*.
+
+## Quality Flags (always check, mention if triggered)
+
+| Condition | Flag |
+|---|---|
+| total_trades < 30 | ⚠️ 样本量不足 (<30笔), 结论参考性有限 |
+| win_rate_pct > 80 | ⚠️ 胜率异常高, 可能过拟合 |
+| max_drawdown_pct > 25 | ⚠️ 回撤过大, 多数交易者无法承受 |
+| excess_return_pct < 0 | ⚠️ 跑输持币不动, 策略不创造 alpha |
+| sharpe_ratio < 0.5 | ⚠️ 风险调整收益差 |
+| profit_factor < 1.0 | ⚠️ 策略在亏钱 (每赚1块要亏>1块) |
+| max_consecutive_losses > 8 | ⚠️ 连续亏损过长, 心理承受力考验 |
+
+## Iteration Suggestions (pick the most relevant ONE)
+
+| Problem | Suggestion |
+|---|---|
+| Low win rate | 放宽入场阈值 or 加确认指标 |
+| High drawdown | 收紧止损 or 减小仓位 |
+| Few trades | 放宽条件 or 缩短 timeframe |
+| Negative excess | 换方向 or 换策略类型 (趋势→均值回归) |
+| Good results | 跑不同时段做 out-of-sample 验证 |
+
+## Available Indicators
+
+| Category | Names | Default |
+|---|---|---|
+| MA | sma, ema, dema, hma, wma | period=20 |
+| Momentum | rsi, macd, roc, cci | period=14 |
+| Bands | bollinger, stoch | period=20 |
+| Volatility | atr | period=14 |
+
+Multi-output field references: `macd.signal`, `bollinger.lower`, `stoch.k`
+
+## Condition Operators
+
+`lt`, `gt`, `lte`, `gte`, `eq`, `cross_above`, `cross_below`
+
+Threshold: number (30) or indicator ref ("macd.signal", "bollinger.lower", "close")

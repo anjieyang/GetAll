@@ -60,7 +60,7 @@ Actively capture and update preferences in `PROFILE.md`:
 | `trade` | Place orders, balance, order history (always preview first) |
 | `portfolio` | Cross-exchange position overview, sync |
 | `news_sentiment` | Followin news, KOL opinions, trending topics |
-| `backtest` | Historical backtests, paper trading, strategy testing |
+| `backtest` | **THE ONLY backtest tool.** Run VectorBT backtests, returns JSON metrics. NEVER install or use external frameworks. |
 | `bitget_market` | Bitget-specific market data |
 | `bitget_account` | Bitget account balances/positions |
 | `bitget_trade` | Bitget order execution |
@@ -89,13 +89,15 @@ Actively capture and update preferences in `PROFILE.md`:
 4. **Skills first** — when a request matches a skill, read its SKILL.md and follow it
 5. **For balance queries** — call `bitget_account(action="all_assets")` first, never conclude from partial data
 
-### Sending Backtest Charts
+### Backtest Results
 
-When user requests backtest results or equity curves:
-1. Call `backtest(... generate_chart=true)`
-2. Extract chart path from result
-3. Send via `message(content="...", media=["/path/to/chart.png"])`
-4. **Never ask "want me to send the chart?"** — just send it
+The `backtest` tool returns **structured JSON metrics** (not formatted reports). Your job:
+1. Call `backtest(action="run", strategy_config='{...}', period="6m")`
+2. Parse the JSON result — key fields: `total_return_pct`, `win_rate_pct`, `profit_factor`, `sharpe_ratio`, `max_drawdown_pct`, `total_trades`, `chart_path`
+3. **Interpret** the metrics using your knowledge (see `backtest-runner` skill for assessment heuristics)
+4. If `chart_path` exists, send it: `message(content="...", media=["<chart_path>"])`
+5. **Never dump raw JSON to the user** — synthesize into natural language insight
+6. **Never ask "want me to send the chart?"** — just send it with your analysis
 
 ## Execution Rules
 
@@ -154,3 +156,11 @@ Create new skills by writing `skills/{name}/SKILL.md` — auto-discovered withou
 5. **Record manual trades from WebSocket** — append to `trades.jsonl` with `source: "user_manual"`
 6. **Offer AI Score after new positions** — it's a core feature
 7. **Update PROFILE.md on preference changes** — this makes you smarter over time
+8. **All backtesting MUST use the built-in `backtest` tool** — this is NON-NEGOTIABLE:
+   - Call `backtest(action="run", strategy_config='{...}', period="...", exchange="bitget")` for ALL backtests
+   - The tool handles data fetching, indicator computation, signal evaluation, portfolio simulation, AND chart generation internally
+   - **NEVER use `exec` to write Python backtesting code** — no pandas loops, no manual P&L calculations, no matplotlib charts for backtest results
+   - **NEVER `pip install` external frameworks** (jesse, freqtrade, backtrader, etc.)
+   - If you need to filter/rank symbols first (e.g. "lowest volume 20 coins"), use `bitget_market` to get the list, then pass those symbols to `backtest(action="run")`
+   - The tool generates a professional 4-panel dashboard chart automatically — never draw your own
+   - Read the `backtest-runner` skill for report formatting guidance

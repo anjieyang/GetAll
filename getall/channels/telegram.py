@@ -245,6 +245,18 @@ class TelegramChannel(BaseChannel):
             logger.error(f"Invalid chat_id: {msg.chat_id}")
             return
 
+        # ── Voice message: send as voice note ──
+        if msg.audio_path:
+            from pathlib import Path
+            audio_file = Path(msg.audio_path)
+            if audio_file.is_file():
+                try:
+                    with open(audio_file, "rb") as af:
+                        await self._app.bot.send_voice(chat_id=chat_id, voice=af)
+                    return
+                except Exception as exc:
+                    logger.warning(f"Failed to send voice note, falling back to text: {exc}")
+
         chunks = _split_into_chunks(msg.content)
 
         for i, chunk in enumerate(chunks):
@@ -469,6 +481,11 @@ class TelegramChannel(BaseChannel):
         self._start_typing(str_chat_id)
         
         # Forward to the message bus
+        # Detect voice/audio messages for voice mode auto-enable.
+        is_audio = media_type in ("voice", "audio")
+        audio_file = ""
+        if is_audio and media_paths:
+            audio_file = media_paths[0]
         await self._handle_message(
             sender_id=sender_id,
             chat_id=str_chat_id,
@@ -479,7 +496,9 @@ class TelegramChannel(BaseChannel):
                 "user_id": user.id,
                 "username": user.username,
                 "first_name": user.first_name,
-                "is_group": message.chat.type != "private"
+                "is_group": message.chat.type != "private",
+                "is_audio": is_audio,
+                "audio_path": audio_file,
             },
             sender_name=(user.full_name or user.first_name or user.username or ""),
             chat_type="private" if message.chat.type == "private" else "group",

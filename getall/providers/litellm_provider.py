@@ -104,8 +104,9 @@ class LiteLLMProvider(LLMProvider):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         model: str | None = None,
-        max_tokens: int = 4096,
+        max_tokens: int = 65536,
         temperature: float = 0.7,
+        reasoning_effort: str = "",
     ) -> LLMResponse:
         """
         Send a chat completion request via LiteLLM.
@@ -115,7 +116,9 @@ class LiteLLMProvider(LLMProvider):
             tools: Optional list of tool definitions in OpenAI format.
             model: Model identifier (e.g., 'anthropic/claude-sonnet-4-5').
             max_tokens: Maximum tokens in response.
-            temperature: Sampling temperature.
+            temperature: Sampling temperature (kept for backward compatibility).
+            reasoning_effort: Reasoning effort level ("none","low","medium","high","xhigh").
+                Empty string means no reasoning param is sent.
         
         Returns:
             LLMResponse with content and/or tool calls.
@@ -126,8 +129,11 @@ class LiteLLMProvider(LLMProvider):
             "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
-            "temperature": temperature,
         }
+        
+        # Reasoning effort (OpenAI Responses API / o-series / gpt-5+)
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
         
         # Apply model-specific overrides (e.g. kimi-k2.5 temperature)
         self._apply_model_overrides(model, kwargs)
@@ -152,11 +158,32 @@ class LiteLLMProvider(LLMProvider):
             response = await acompletion(**kwargs)
             return self._parse_response(response)
         except Exception as e:
-            # Return error as content for graceful handling
+            from loguru import logger
+            logger.error(f"LLM call failed ({model}): {e}")
+            # Return a user-friendly error; raw exception details stay in logs only.
+            user_msg = self._friendly_error(e)
             return LLMResponse(
-                content=f"Error calling LLM: {str(e)}",
+                content=user_msg,
                 finish_reason="error",
             )
+
+    @staticmethod
+    def _friendly_error(exc: Exception) -> str:
+        """Map raw LLM exceptions to user-friendly messages."""
+        raw = str(exc).lower()
+        if "max_output_tokens" in raw or "max_tokens" in raw or "length" in raw:
+            return "回复内容太长被截断了，请换个更简短的问法再试一次。"
+        if "rate_limit" in raw or "429" in raw:
+            return "请求太频繁了，稍等几秒再试。"
+        if "context_length" in raw or "context window" in raw:
+            return "对话太长了，我需要清理一下上下文。请重新提问。"
+        if "timeout" in raw:
+            return "请求超时了，请稍后再试。"
+        if "connection" in raw or "connect" in raw:
+            return "网络连接出了点问题，请稍后再试。"
+        if "authentication" in raw or "401" in raw or "403" in raw:
+            return "认证出了点问题，请联系管理员。"
+        return "服务暂时出了点问题，请稍后再试。"
     
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""

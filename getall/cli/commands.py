@@ -302,13 +302,25 @@ def gateway(
         provider=provider,
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
+        max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
         brave_api_key=config.tools.web.search.api_key or None,
+        web_search_provider=config.tools.web.search.provider,
+        web_search_api_key=config.tools.web.search.api_key or None,
+        web_search_openai_api_key=(
+            config.tools.web.search.openai_api_key
+            or config.providers.openai.api_key
+            or None
+        ),
+        web_search_openai_model=config.tools.web.search.openai_model,
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
+        trading_config=config.trading,
+        max_concurrent_workers=config.agents.defaults.max_concurrent_workers,
+        reasoning_effort=config.agents.defaults.reasoning_effort,
     )
 
     def _telegram_group_mention(sender_id: str) -> str:
@@ -356,10 +368,32 @@ def gateway(
         if stripped.startswith(mention):
             return content
         return f"{mention} {content}"
+
+    def _build_cron_agent_prompt(job: CronJob, task_prompt: str) -> str:
+        """Wrap cron-triggered task with anti-recursion guardrails."""
+        return (
+            "You are executing an existing scheduled task trigger.\n"
+            f"Cron Job ID: {job.id}\n\n"
+            "CRITICAL RULES:\n"
+            "1) The schedule already exists. Do NOT create/update/list/delete reminders now.\n"
+            "2) Execute only the task content below.\n"
+            "3) Use data/trading/tools as needed and return this trigger's result.\n\n"
+            f"Task:\n{task_prompt}"
+        )
     
     # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | None:
-        """Execute a cron job through the agent."""
+        """Execute a cron job through the agent.
+
+        Jobs with a ``principal_id`` are user-scoped and route to that user's
+        own channel/chat. Jobs without a ``principal_id`` but with explicit
+        ``channel`` + ``to`` are treated as legacy single-recipient jobs.
+        Truly global jobs (no principal and no explicit target, e.g. cron seed
+        trading tasks) are executed once per registered principal route so each
+        user receives their own notification.
+        """
+        from getall.routing import load_all_routes
+
         # Direct notification mode: send payload as-is, do not invoke LLM.
         if job.payload.kind == "direct_message":
             content = job.payload.message
@@ -391,27 +425,99 @@ def gateway(
                 f"After completing the main task, also send exactly: {job.payload.final_message}"
             )
 
-        response = await agent.process_direct(
-            reminder_prompt,
-            session_key=f"cron:{job.id}",
-            channel=job.payload.channel or "cli",
-            chat_id=job.payload.to or "direct",
-            sender_id=job.payload.sender_id or "user",
-            tenant_id=job.payload.tenant_id or "default",
-            principal_id=job.payload.principal_id or "",
-            agent_identity_id=job.payload.agent_identity_id or "",
-            thread_id=job.payload.thread_id or "",
-            chat_type=job.payload.chat_type or "private",
-        )
-        response = _render_group_targeted_content(job, response or "")
-        if job.payload.deliver and job.payload.to:
-            from getall.bus.events import OutboundMessage
-            await bus.publish_outbound(OutboundMessage(
-                channel=job.payload.channel or "cli",
+        # ── Legacy targeted job (no principal_id, but explicit destination) ──
+        # Older reminder records may miss identity fields. Never fan them out
+        # globally when they already carry an explicit delivery target.
+        if not job.payload.principal_id and job.payload.channel and job.payload.to:
+            response = await agent.process_direct(
+                reminder_prompt,
+                session_key=f"cron:{job.id}",
+                channel=job.payload.channel,
                 chat_id=job.payload.to,
-                content=response or ""
-            ))
-        return response
+                sender_id=job.payload.sender_id or "user",
+                tenant_id=job.payload.tenant_id or "default",
+                thread_id=job.payload.thread_id or "",
+                chat_type=job.payload.chat_type or "private",
+            )
+            response = _render_group_targeted_content(job, response or "")
+            if job.payload.deliver and job.payload.to:
+                from getall.bus.events import OutboundMessage
+                await bus.publish_outbound(OutboundMessage(
+                    channel=job.payload.channel or "cli",
+                    chat_id=job.payload.to,
+                    content=response or ""
+                ))
+            return response
+
+        cron_agent_prompt = _build_cron_agent_prompt(job, reminder_prompt)
+
+        # ── User-scoped job (has principal_id) ──
+        if job.payload.principal_id:
+            response = await agent.process_direct(
+                cron_agent_prompt,
+                session_key=f"cron:{job.id}",
+                channel=job.payload.channel or "cli",
+                chat_id=job.payload.to or "direct",
+                sender_id=job.payload.sender_id or "user",
+                tenant_id=job.payload.tenant_id or "default",
+                principal_id=job.payload.principal_id,
+                agent_identity_id=job.payload.agent_identity_id or "",
+                thread_id=job.payload.thread_id or "",
+                chat_type=job.payload.chat_type or "private",
+                metadata={
+                    "synthetic": True,
+                    "source": "cron",
+                    "cron_job_id": job.id,
+                    "cron_payload_kind": job.payload.kind,
+                },
+            )
+            response = _render_group_targeted_content(job, response or "")
+            if job.payload.deliver and job.payload.to:
+                from getall.bus.events import OutboundMessage
+                await bus.publish_outbound(OutboundMessage(
+                    channel=job.payload.channel or "cli",
+                    chat_id=job.payload.to,
+                    content=response or ""
+                ))
+            return response
+
+        # ── Global job (no principal_id, e.g. cron seed trading tasks) ──
+        # Execute once per registered principal so each user gets their own
+        # isolated agent turn + notification in the correct channel/chat.
+        routes = load_all_routes()
+        if not routes:
+            # No users registered yet — run with defaults (output to logs only)
+            return await agent.process_direct(
+                cron_agent_prompt,
+                session_key=f"cron:{job.id}",
+                metadata={
+                    "synthetic": True,
+                    "source": "cron",
+                    "cron_job_id": job.id,
+                    "cron_payload_kind": job.payload.kind,
+                },
+            )
+
+        last_response: str | None = None
+        for principal_id, route in routes.items():
+            response = await agent.process_direct(
+                cron_agent_prompt,
+                session_key=f"cron:{job.id}:{principal_id}",
+                channel=route.channel,
+                chat_id=route.chat_id,
+                sender_id=f"cron:{job.id}",
+                tenant_id=job.payload.tenant_id or "default",
+                principal_id=principal_id,
+                chat_type="private",
+                metadata={
+                    "synthetic": True,
+                    "source": "cron",
+                    "cron_job_id": job.id,
+                    "cron_payload_kind": job.payload.kind,
+                },
+            )
+            last_response = response
+        return last_response
     cron.on_job = on_cron_job
     
     # Create heartbeat service
@@ -531,11 +637,23 @@ def agent(
         provider=provider,
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
+        max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
         brave_api_key=config.tools.web.search.api_key or None,
+        web_search_provider=config.tools.web.search.provider,
+        web_search_api_key=config.tools.web.search.api_key or None,
+        web_search_openai_api_key=(
+            config.tools.web.search.openai_api_key
+            or config.providers.openai.api_key
+            or None
+        ),
+        web_search_openai_model=config.tools.web.search.openai_model,
         exec_config=config.tools.exec,
         restrict_to_workspace=config.tools.restrict_to_workspace,
+        trading_config=config.trading,
+        max_concurrent_workers=config.agents.defaults.max_concurrent_workers,
+        reasoning_effort=config.agents.defaults.reasoning_effort,
     )
     
     # Show spinner when logs are off (no output to miss); skip when logs are on

@@ -50,5 +50,7 @@ class OutboundMessage:
     # optional routing hint
     principal_id: str = ""
     thread_id: str = ""
+    # Voice: path to audio file (opus/mp3). When set, channel sends as voice.
+    audio_path: str = ""
 
 

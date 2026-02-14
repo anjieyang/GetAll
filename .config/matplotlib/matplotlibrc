@@ -1,0 +1,17 @@
+# GetAll matplotlib defaults – headless + CJK font support
+backend: Agg
+
+# CJK font fallbacks (in order of preference):
+#   1. WenQuanYi Micro Hei – most common on Chinese Linux
+#   2. Noto Sans CJK SC – Google's universal CJK
+#   3. WenQuanYi Zen Hei – older WQY
+#   4. SimHei – Windows-origin, sometimes available
+#   5. DejaVu Sans – last resort (no CJK, but won't crash)
+font.sans-serif: WenQuanYi Micro Hei, Noto Sans CJK SC, WenQuanYi Zen Hei, SimHei, Arial Unicode MS, DejaVu Sans
+font.family: sans-serif
+axes.unicode_minus: False
+
+# Tight layout by default for cleaner chart output
+figure.autolayout: True
+savefig.dpi: 150
+savefig.bbox: tight

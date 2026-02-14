@@ -80,6 +80,12 @@ class ExecTool(Tool):
             env["PATH"] = venv_bin + ":" + env.get("PATH", "")
             env["VIRTUAL_ENV"] = venv
 
+        # Matplotlib: point to workspace config for CJK font + headless backend
+        if "MPLCONFIGDIR" not in env:
+            mpl_cfg = Path(cwd) / ".config" / "matplotlib"
+            if mpl_cfg.is_dir():
+                env["MPLCONFIGDIR"] = str(mpl_cfg)
+
         # Snapshot: record existing image files before execution
         t_before = time.time()
         

@@ -1,6 +1,6 @@
 ---
 name: kol-tracker
-description: "Learn from KOL trading patterns. Analyze crypto KOLs' trading styles, historical call accuracy, and extract their strategies into reusable templates using Followin data."
+description: "Learn from KOL trading patterns. Analyze crypto KOLs' trading styles, historical call accuracy, and extract their strategies into reusable templates via Followin data. Use when user says 'learn from @{name}', 'study this KOL', '学习/分析这个KOL', 'track KOL calls', or wants to replicate a KOL's approach."
 metadata: '{"getall":{"always":false}}'
 ---
 

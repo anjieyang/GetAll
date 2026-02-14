@@ -1,6 +1,6 @@
 ---
 name: tmux
-description: Remote-control tmux sessions for interactive CLIs by sending keystrokes and scraping pane output.
+description: "Remote-control tmux sessions for interactive CLIs by sending keystrokes and scraping pane output. Use when the agent needs an interactive terminal, persistent shell session, or to orchestrate multiple CLI agents in parallel."
 metadata: {"getall":{"emoji":"🧵","os":["darwin","linux"],"requires":{"bins":["tmux"]}}}
 ---
 

@@ -1,10 +1,14 @@
 """Web tools: web_search and web_fetch.
 
-web_search supports two providers:
-- "brave"  -> Brave Search API (needs api_key / BRAVE_API_KEY)
-- "openai" -> OpenAI Responses API built-in web_search (needs openai_api_key)
+web_search supports three providers:
+- "brave"      -> Brave Search API (needs api_key / BRAVE_API_KEY)
+- "openai"     -> OpenAI Responses API built-in web_search (needs openai_api_key)
+- "duckduckgo" -> DuckDuckGo Lite via jina-ai mirror (no API key)
 
-Auto-fallback: if provider="brave" but no Brave key is set, uses OpenAI.
+Auto-fallback strategy:
+1) configured provider
+2) alternate provider with available credentials
+3) DuckDuckGo (no-key baseline)
 """
 
 import html
@@ -12,7 +16,7 @@ import json
 import os
 import re
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import httpx
 
@@ -82,12 +86,18 @@ class WebSearchTool(Tool):
         self.openai_model = openai_model
 
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
-        if self.provider == "openai":
+        provider = (self.provider or "brave").strip().lower()
+        if provider == "openai":
+            if self.openai_api_key:
+                return await self._search_openai(query, count)
+            return await self._search_duckduckgo(query, count)
+        if provider == "duckduckgo":
+            return await self._search_duckduckgo(query, count)
+        if self.api_key:
+            return await self._search_brave(query, count)
+        if self.openai_api_key:
             return await self._search_openai(query, count)
-        # Brave first; auto-fallback to OpenAI if no Brave key
-        if not self.api_key and self.openai_api_key:
-            return await self._search_openai(query, count)
-        return await self._search_brave(query, count)
+        return await self._search_duckduckgo(query, count)
 
     # -- Brave --------------------------------------------------------
 
@@ -115,6 +125,64 @@ class WebSearchTool(Tool):
             return "\n".join(lines)
         except Exception as exc:
             return f"Error: {exc}"
+
+    # -- DuckDuckGo (no key) -------------------------------------------
+
+    async def _search_duckduckgo(self, query: str, count: int | None = None) -> str:
+        """Search via DuckDuckGo Lite through jina-ai mirror."""
+        n = min(max(count or self.max_results, 1), 10)
+        mirror_url = f"https://r.jina.ai/http://lite.duckduckgo.com/lite/?q={quote_plus(query)}"
+        try:
+            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+                r = await client.get(mirror_url, headers={"User-Agent": USER_AGENT})
+                r.raise_for_status()
+            results = self._extract_duckduckgo_results(r.text, n)
+            if not results:
+                return f"No results for: {query}"
+            lines = [f"Results for: {query}\n"]
+            for i, item in enumerate(results, 1):
+                lines.append(f"{i}. {item['title']}\n   {item['url']}")
+                if item["snippet"]:
+                    lines.append(f"   {item['snippet']}")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"Error: DuckDuckGo search failed: {exc}"
+
+    def _extract_duckduckgo_results(self, body: str, limit: int) -> list[dict[str, str]]:
+        marker = "Markdown Content:"
+        text = body.split(marker, 1)[1] if marker in body else body
+        pattern = re.compile(
+            r"(?ms)^\s*\d+\.\[(?P<title>.+?)\]\((?P<url>https?://[^\s)]+)\)\s*"
+            r"(?P<snippet>.*?)(?=^\s*\d+\.\[|\Z)"
+        )
+        results: list[dict[str, str]] = []
+        for match in pattern.finditer(text):
+            title = html.unescape(match.group("title").strip())
+            url = self._unwrap_duckduckgo_redirect(match.group("url").strip())
+            snippet = self._normalize_snippet(match.group("snippet"))
+            if not title or not url:
+                continue
+            results.append({"title": title, "url": url, "snippet": snippet})
+            if len(results) >= limit:
+                break
+        return results
+
+    @staticmethod
+    def _normalize_snippet(raw: str) -> str:
+        lines = [line.strip() for line in raw.splitlines() if line.strip()]
+        if not lines:
+            return ""
+        text = lines[0]
+        text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+        return html.unescape(text)
+
+    @staticmethod
+    def _unwrap_duckduckgo_redirect(url: str) -> str:
+        parsed = urlparse(url)
+        if "duckduckgo.com" not in parsed.netloc or parsed.path != "/l/":
+            return url
+        target = parse_qs(parsed.query).get("uddg", [""])[0]
+        return unquote(target) if target else url
 
     # -- OpenAI Responses API -----------------------------------------
 

@@ -161,8 +161,10 @@ class AgentDefaults(BaseModel):
     """Default agent configuration."""
     workspace: str = "~/.getall/workspace"
     model: str = "anthropic/claude-opus-4-5"
-    max_tokens: int = 8192
+    max_tokens: int = 65536
+    max_concurrent_workers: int = 8
     temperature: float = 0.7
+    reasoning_effort: str = ""  # "", "none", "low", "medium", "high", "xhigh" (empty = no reasoning param)
     max_tool_iterations: int = 20
     memory_window: int = 50
 
@@ -208,8 +210,9 @@ class WebSearchConfig(BaseModel):
         - "brave"  -> uses Brave Search API (needs api_key / BRAVE_API_KEY)
         - "openai" -> uses OpenAI Responses API built-in web_search tool
                       (needs openai_api_key / OPENAI_API_KEY)
+        - "duckduckgo" -> uses DuckDuckGo Lite (no API key required)
     """
-    provider: str = "brave"  # "brave" or "openai"
+    provider: str = "brave"  # "brave" or "openai" or "duckduckgo"
     api_key: str = ""  # Brave Search API key (provider=brave)
     max_results: int = 5
     openai_api_key: str = ""  # OpenAI API key (provider=openai, empty = auto from providers.openai)

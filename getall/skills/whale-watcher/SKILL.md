@@ -1,6 +1,6 @@
 ---
 name: whale-watcher
-description: "Track whale movements. Monitor large on-chain transfers, exchange inflows/outflows, and large orderbook walls using Coinglass data."
+description: "Track whale movements with in-depth analysis. Monitor large on-chain transfers, exchange inflows/outflows, and large orderbook walls via Coinglass. Use when user asks about whale activity, 巨鲸动向, large transfers, exchange flows, or '鲸鱼在干嘛'. For detailed whale deep-dives; anomaly-detector handles whale alerts as part of broader scans."
 metadata: '{"getall":{"always":false}}'
 ---
 
@@ -15,6 +15,10 @@ Monitor and interpret large-scale capital movements including whale transfers, e
 - Part of `cron:anomaly-scan` checks (whale_transfers dimension)
 - User says "check large transfers for {SYMBOL}"
 - Pre-trade analysis (whale activity as a signal input)
+
+## Relationship with anomaly-detector
+
+The `anomaly-detector` skill includes whale transfers as ONE dimension in its batch scan — it flags whale anomalies but does not provide deep analysis. This skill (`whale-watcher`) provides the **detailed interpretation**: transfer pattern analysis, exchange flow trends, orderbook wall detection, and synthesized narratives. When `anomaly-detector` flags a whale anomaly, use this skill to dig deeper.
 
 ## Data Sources (All via `market_data` Tool)
 

@@ -1,14 +1,20 @@
-# 回测模块: Nautilus Trader 集成
-# 提供历史回测 + Paper Trading 能力
+# Backtest module: VectorBT-native engine
+# Provides: run_backtest(), generate_chart(), data helpers
 
-from getall.trading.backtest.engine import BacktestRunner, BacktestResult
-from getall.trading.backtest.strategies import TemplateStrategy, TemplateStrategyConfig
-from getall.trading.backtest.data_loader import OHLCVLoader
+from getall.trading.backtest.engine import (
+    run_backtest,
+    generate_chart,
+    compute_indicators,
+    ccxt_to_dataframe,
+    timeframe_to_seconds,
+    estimate_candle_count,
+)
 
 __all__ = [
-    "BacktestRunner",
-    "BacktestResult",
-    "TemplateStrategy",
-    "TemplateStrategyConfig",
-    "OHLCVLoader",
+    "run_backtest",
+    "generate_chart",
+    "compute_indicators",
+    "ccxt_to_dataframe",
+    "timeframe_to_seconds",
+    "estimate_candle_count",
 ]

@@ -1,41 +1,36 @@
-"""Bitget trading tools – exposed to the LLM via tool calling.
+"""Bitget tools exposed to the LLM.
 
-The agent decides when and how to call these based on natural language
-understanding. No hardcoded keyword routing.
-
-Market tools use public endpoints (no credentials required).
-Account and Trade tools MUST use per-user credentials resolved from
-the database. If the user hasn't bound their API key, the operation
-is rejected — there is no global fallback for personal data.
+Routing policy:
+- `bitget_market`: public market endpoints
+- `bitget_account` / `bitget_trade`: common private shortcuts
+- `bitget_uta`: generic private/public endpoint caller for full API coverage
 """
 
 from __future__ import annotations
 
+from contextvars import ContextVar
+from dataclasses import dataclass
 import json
 from typing import Any
 
 from getall.agent.tools.base import Tool
-from getall.integrations.bitget.gateway import BitgetCredentials, BitgetGateway
+from getall.integrations.bitget.uta_catalog import (
+    build_uta_coverage_report,
+    describe_endpoint,
+    list_uta_catalog,
+)
+from getall.integrations.bitget.uta_gateway import (
+    BitgetCredentials,
+    BitgetError,
+    BitgetGateway,
+)
 
-
-# ---------------------------------------------------------------------------
-# Market gateway singleton — public endpoints, no credentials needed
-# ---------------------------------------------------------------------------
-
-_market_gw: BitgetGateway | None = None
-
-
-def _market_gateway() -> BitgetGateway:
-    """Lazy singleton for public market data (no API key required)."""
-    global _market_gw
-    if _market_gw is None:
-        _market_gw = BitgetGateway()
-    return _market_gw
-
-
-# ---------------------------------------------------------------------------
-# Per-user gateway — personal credentials from DB
-# ---------------------------------------------------------------------------
+_LEGACY_FUTURES_SIDE: dict[str, tuple[str, str]] = {
+    "open_long": ("buy", "open"),
+    "open_short": ("sell", "open"),
+    "close_long": ("buy", "close"),
+    "close_short": ("sell", "close"),
+}
 
 _NO_CREDENTIALS_MSG = (
     "No exchange credentials bound for this user. "
@@ -43,46 +38,105 @@ _NO_CREDENTIALS_MSG = (
     "API Key, API Secret, and Passphrase in a private chat."
 )
 
+_market_gw: BitgetGateway | None = None
+
+
+def _market_gateway() -> BitgetGateway:
+    global _market_gw
+    if _market_gw is None:
+        _market_gw = BitgetGateway()
+    return _market_gw
+
+
+@dataclass(frozen=True, slots=True)
+class _PrivateBitgetContext:
+    principal_id: str = ""
+    session_factory: Any = None
+
 
 async def _resolve_user_gateway(
     principal_id: str,
     session_factory: Any,
 ) -> BitgetGateway | None:
-    """Try to build a BitgetGateway with the user's own credentials."""
-    if not principal_id or session_factory is None:
+    if not principal_id:
         return None
+    if session_factory is None:
+        raise BitgetError("database session not available for credential lookup")
     try:
         from getall.storage.repository import CredentialRepo
 
         async with session_factory() as session:
             repo = CredentialRepo(session)
             creds = await repo.get(principal_id, "bitget")
-        if creds is None:
-            return None
-        return BitgetGateway(
-            credentials=BitgetCredentials(
-                api_key=creds["api_key"],
-                api_secret=creds["api_secret"],
-                passphrase=creds["passphrase"],
-            )
-        )
-    except Exception:
+    except Exception as exc:
+        raise BitgetError(f"failed to load bitget credentials for principal '{principal_id}': {exc}") from exc
+
+    if creds is None:
         return None
+    return BitgetGateway(
+        credentials=BitgetCredentials(
+            api_key=creds["api_key"],
+            api_secret=creds["api_secret"],
+            passphrase=creds["passphrase"],
+        )
+    )
 
 
-# ---------------------------------------------------------------------------
-# Market tool — public endpoints, no personal credentials needed
-# ---------------------------------------------------------------------------
+def _json_result(data: Any, limit: int) -> str:
+    return json.dumps(data, ensure_ascii=False)[:limit]
+
+
+def _derive_futures_side(action: str, side: str) -> str:
+    normalized = (side or "").strip().lower()
+    if normalized:
+        return normalized
+    return "open_long" if action == "futures_open" else "close_long"
+
+
+def _build_futures_order_args(
+    *,
+    action: str,
+    symbol: str,
+    size: str,
+    price: str,
+    side: str,
+    trade_side: str,
+    order_type: str,
+    product_type: str,
+    margin_mode: str,
+) -> dict[str, Any]:
+    args: dict[str, Any] = {
+        "symbol": symbol,
+        "productType": product_type,
+        "marginMode": margin_mode,
+        "orderType": order_type,
+        "size": size,
+    }
+    normalized_side = _derive_futures_side(action, side)
+    normalized_trade_side = (trade_side or "").strip().lower()
+    buy_sell = normalized_side
+    resolved_trade_side = normalized_trade_side or ("open" if action == "futures_open" else "close")
+
+    if normalized_side in _LEGACY_FUTURES_SIDE:
+        mapped_side, mapped_trade_side = _LEGACY_FUTURES_SIDE[normalized_side]
+        buy_sell = mapped_side
+        if not normalized_trade_side:
+            resolved_trade_side = mapped_trade_side
+
+    args["side"] = buy_sell
+    args["tradeSide"] = resolved_trade_side
+    if (order_type or "").strip().lower() == "limit":
+        args["price"] = price
+    return args
 
 
 class BitgetMarketTool(Tool):
-    """Query Bitget market data: tickers, candles, depth, funding rate."""
+    """Public market data shortcuts."""
 
     name = "bitget_market"
     description = (
-        "Fetch real-time crypto market data from Bitget. "
-        "Actions: tickers, candles, depth, funding_rate. "
-        "Default product_type is USDT-FUTURES."
+        "Fetch public market data from Bitget. "
+        "Actions: tickers, candles, depth, funding_rate."
     )
     parameters = {
         "type": "object",
@@ -90,31 +144,24 @@ class BitgetMarketTool(Tool):
             "action": {
                 "type": "string",
                 "enum": ["tickers", "candles", "depth", "funding_rate"],
-                "description": "Which market data to fetch",
             },
-            "symbol": {
-                "type": "string",
-                "description": "Trading pair symbol, e.g. BTCUSDT",
-            },
-            "product_type": {
-                "type": "string",
-                "description": "Product type: USDT-FUTURES, COIN-FUTURES, USDC-FUTURES, or SPOT",
-            },
-            "granularity": {
-                "type": "string",
-                "description": "Candle granularity: 1m,5m,15m,30m,1H,4H,1D,1W",
-            },
-            "limit": {
-                "type": "integer",
-                "description": "Number of results to return",
-                "minimum": 1,
-                "maximum": 200,
-            },
+            "symbol": {"type": "string"},
+            "product_type": {"type": "string"},
+            "granularity": {"type": "string"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 200},
         },
         "required": ["action"],
     }
 
-    async def execute(self, action: str, symbol: str = "", product_type: str = "USDT-FUTURES", granularity: str = "1H", limit: int = 20, **kw: Any) -> str:
+    async def execute(
+        self,
+        action: str,
+        symbol: str = "",
+        product_type: str = "USDT-FUTURES",
+        granularity: str = "1H",
+        limit: int = 20,
+        **kw: Any,
+    ) -> str:
         gw = _market_gateway()
         try:
             if action == "tickers":
@@ -122,7 +169,12 @@ class BitgetMarketTool(Tool):
             elif action == "candles":
                 if not symbol:
                     return "Error: symbol is required for candles"
-                data = await gw.get_candles(symbol=symbol, granularity=granularity, product_type=product_type, limit=limit)
+                data = await gw.get_candles(
+                    symbol=symbol,
+                    granularity=granularity,
+                    product_type=product_type,
+                    limit=limit,
+                )
             elif action == "depth":
                 if not symbol:
                     return "Error: symbol is required for depth"
@@ -133,25 +185,19 @@ class BitgetMarketTool(Tool):
                 data = await gw.get_funding_rate(symbol=symbol, product_type=product_type)
             else:
                 return f"Error: unknown action '{action}'"
-            return json.dumps(data, ensure_ascii=False)[:4000]
-        except Exception as e:
-            return f"Error: {e}"
-
-
-# ---------------------------------------------------------------------------
-# Account tool — per-user credentials only, no fallback
-# ---------------------------------------------------------------------------
+            return _json_result(data, limit=4000)
+        except Exception as exc:
+            return f"Error: bitget_market action '{action}' failed: {exc}"
 
 
 class BitgetAccountTool(Tool):
-    """Query Bitget account info: all wallets, positions, bills."""
+    """Common account shortcuts on top of direct UTA REST."""
 
     name = "bitget_account"
     description = (
-        "Fetch Bitget account information. "
-        "Actions: all_assets (spot+futures+funding in one call), spot_assets, futures_assets, positions, bills. "
-        "For any 'do I have money / balance / funds' question, always use all_assets first before any narrower action. "
-        "Never conclude 'no money' from futures-only data."
+        "Shortcut wrapper for common account queries over direct Bitget UTA REST. "
+        "Actions: all_assets, spot_assets, futures_assets, positions, bills. "
+        "For any endpoint beyond shortcuts, use bitget_uta."
     )
     parameters = {
         "type": "object",
@@ -159,74 +205,84 @@ class BitgetAccountTool(Tool):
             "action": {
                 "type": "string",
                 "enum": ["all_assets", "spot_assets", "futures_assets", "positions", "bills", "assets"],
-                "description": "What account data to fetch. Use all_assets to see everything. 'assets' is treated as all_assets.",
                 "default": "all_assets",
             },
-            "product_type": {
-                "type": "string",
-                "description": "For futures_assets/positions/bills: USDT-FUTURES, COIN-FUTURES, USDC-FUTURES",
-            },
-            "symbol": {
-                "type": "string",
-                "description": "Symbol filter for positions",
-            },
-            "coin": {
-                "type": "string",
-                "description": "Coin filter for spot_assets (e.g. USDT, BTC)",
-            },
+            "product_type": {"type": "string"},
+            "symbol": {"type": "string"},
+            "coin": {"type": "string"},
         },
         "required": [],
     }
 
     def __init__(self) -> None:
-        self._principal_id: str = ""
-        self._session_factory: Any = None
+        self._context: ContextVar[_PrivateBitgetContext] = ContextVar(
+            "bitget_account_tool_context",
+            default=_PrivateBitgetContext(),
+        )
 
     def set_context(self, principal_id: str, session_factory: Any) -> None:
-        self._principal_id = principal_id
-        self._session_factory = session_factory
+        self._context.set(_PrivateBitgetContext(principal_id=principal_id, session_factory=session_factory))
 
-    async def execute(self, action: str = "all_assets", product_type: str = "USDT-FUTURES", symbol: str = "", coin: str = "", **kw: Any) -> str:
-        gw = await _resolve_user_gateway(self._principal_id, self._session_factory)
+    async def execute(
+        self,
+        action: str = "all_assets",
+        product_type: str = "USDT-FUTURES",
+        symbol: str = "",
+        coin: str = "",
+        **kw: Any,
+    ) -> str:
+        context = self._context.get()
+        try:
+            gw = await _resolve_user_gateway(context.principal_id, context.session_factory)
+        except BitgetError as exc:
+            return f"Error: {exc}"
         if gw is None:
             return f"Error: {_NO_CREDENTIALS_MSG}"
 
-        try:
-            action_key = (action or "all_assets").strip() or "all_assets"
-            if action_key == "assets":
-                action_key = "all_assets"
+        action_key = (action or "all_assets").strip() or "all_assets"
+        if action_key == "assets":
+            action_key = "all_assets"
 
+        try:
             if action_key == "all_assets":
-                data = await gw.get_all_assets()
+                data = await gw.get_account_assets(account_type="all", coin=coin)
             elif action_key == "spot_assets":
-                data = await gw.get_spot_assets(coin=coin)
+                data = await gw.get_account_assets(account_type="spot", coin=coin)
             elif action_key == "futures_assets":
-                data = await gw.get_futures_assets(product_type=product_type)
+                data = await gw.get_account_assets(
+                    account_type="futures",
+                    coin=coin,
+                    product_type=product_type,
+                )
             elif action_key == "positions":
                 data = await gw.get_positions(product_type=product_type, symbol=symbol)
             elif action_key == "bills":
-                data = await gw.get_bills(product_type=product_type)
+                data = await gw.get_account_bills(
+                    account_type="futures",
+                    product_type=product_type,
+                )
             else:
-                return f"Error: unknown action '{action_key}'"
-            return json.dumps(data, ensure_ascii=False)[:8000]
-        except Exception as e:
-            return f"Error: {e}"
-
-
-# ---------------------------------------------------------------------------
-# Trade tool — MUST use per-user credentials, never global
-# ---------------------------------------------------------------------------
+                return (
+                    f"Error: unknown action '{action_key}'. "
+                    "Use bitget_uta for full UTA endpoint coverage."
+                )
+            return _json_result(data, limit=8000)
+        except BitgetError as exc:
+            return f"Error: {exc}"
+        except Exception as exc:
+            return f"Error: bitget_account action '{action_key}' failed: {exc}"
+        finally:
+            await gw.close()
 
 
 class BitgetTradeTool(Tool):
-    """Execute trades on Bitget: spot and futures orders."""
+    """Common trade shortcuts on top of direct UTA REST."""
 
     name = "bitget_trade"
     description = (
-        "Place or cancel orders on Bitget. "
+        "Shortcut wrapper for common trading operations over direct Bitget UTA REST. "
         "Actions: spot_buy, spot_sell, futures_open, futures_close, cancel. "
-        "IMPORTANT: Requires the user to have bound their own exchange API credentials first. "
-        "If no credentials are found, tell the user to bind via private chat."
+        "For any endpoint beyond shortcuts, use bitget_uta."
     )
     parameters = {
         "type": "object",
@@ -234,51 +290,34 @@ class BitgetTradeTool(Tool):
             "action": {
                 "type": "string",
                 "enum": ["spot_buy", "spot_sell", "futures_open", "futures_close", "cancel"],
-                "description": "Trade action to execute",
             },
-            "symbol": {
-                "type": "string",
-                "description": "Trading pair, e.g. BTCUSDT",
+            "symbol": {"type": "string"},
+            "size": {"type": "string"},
+            "price": {"type": "string"},
+            "side": {"type": "string"},
+            "trade_side": {"type": "string"},
+            "order_type": {"type": "string"},
+            "product_type": {"type": "string"},
+            "margin_mode": {"type": "string"},
+            "order_id": {"type": "string"},
+            "order_ids": {
+                "type": "array",
+                "items": {"type": "string"},
             },
-            "size": {
-                "type": "string",
-                "description": "Order size/quantity",
-            },
-            "price": {
-                "type": "string",
-                "description": "Limit price (empty for market order)",
-            },
-            "side": {
-                "type": "string",
-                "description": "For futures: open_long, open_short, close_long, close_short",
-            },
-            "order_type": {
-                "type": "string",
-                "description": "market or limit",
-            },
-            "product_type": {
-                "type": "string",
-                "description": "USDT-FUTURES, COIN-FUTURES, USDC-FUTURES",
-            },
-            "margin_mode": {
-                "type": "string",
-                "description": "crossed or isolated",
-            },
-            "order_id": {
-                "type": "string",
-                "description": "Order ID for cancel action",
-            },
+            "cancel_all": {"type": "boolean"},
+            "margin_coin": {"type": "string"},
         },
         "required": ["action", "symbol"],
     }
 
     def __init__(self) -> None:
-        self._principal_id: str = ""
-        self._session_factory: Any = None
+        self._context: ContextVar[_PrivateBitgetContext] = ContextVar(
+            "bitget_trade_tool_context",
+            default=_PrivateBitgetContext(),
+        )
 
     def set_context(self, principal_id: str, session_factory: Any) -> None:
-        self._principal_id = principal_id
-        self._session_factory = session_factory
+        self._context.set(_PrivateBitgetContext(principal_id=principal_id, session_factory=session_factory))
 
     async def execute(
         self,
@@ -287,37 +326,204 @@ class BitgetTradeTool(Tool):
         size: str = "",
         price: str = "",
         side: str = "",
+        trade_side: str = "",
         order_type: str = "market",
         product_type: str = "USDT-FUTURES",
         margin_mode: str = "crossed",
         order_id: str = "",
+        order_ids: list[str] | None = None,
+        cancel_all: bool = False,
+        margin_coin: str = "",
         **kw: Any,
     ) -> str:
-        gw = await _resolve_user_gateway(self._principal_id, self._session_factory)
+        context = self._context.get()
+        try:
+            gw = await _resolve_user_gateway(context.principal_id, context.session_factory)
+        except BitgetError as exc:
+            return f"Error: {exc}"
         if gw is None:
             return f"Error: {_NO_CREDENTIALS_MSG}"
 
+        action_key = (action or "").strip()
         try:
-            if action == "spot_buy":
-                data = await gw.spot_place_order(symbol=symbol, side="buy", order_type=order_type, size=size, price=price)
-            elif action == "spot_sell":
-                data = await gw.spot_place_order(symbol=symbol, side="sell", order_type=order_type, size=size, price=price)
-            elif action == "futures_open":
-                data = await gw.futures_place_order(
-                    symbol=symbol, product_type=product_type, margin_mode=margin_mode,
-                    side=side or "open_long", order_type=order_type, size=size, price=price,
+            if action_key in {"spot_buy", "spot_sell"}:
+                if not size:
+                    return "Error: size is required for spot orders"
+                if (order_type or "").strip().lower() == "limit" and not price:
+                    return "Error: price is required for limit spot orders"
+                order_payload: dict[str, Any] = {
+                    "symbol": symbol,
+                    "side": "buy" if action_key == "spot_buy" else "sell",
+                    "orderType": order_type,
+                    "size": size,
+                }
+                if price:
+                    order_payload["price"] = price
+                data = await gw.spot_place_order_orders([order_payload])
+                return _json_result(data, limit=4000)
+
+            if action_key in {"futures_open", "futures_close"}:
+                if not size:
+                    return "Error: size is required for futures orders"
+                if (order_type or "").strip().lower() == "limit" and not price:
+                    return "Error: price is required for limit futures orders"
+                order_payload = _build_futures_order_args(
+                    action=action_key,
+                    symbol=symbol,
+                    size=size,
+                    price=price,
+                    side=side,
+                    trade_side=trade_side,
+                    order_type=order_type,
+                    product_type=product_type,
+                    margin_mode=margin_mode,
                 )
-            elif action == "futures_close":
-                data = await gw.futures_place_order(
-                    symbol=symbol, product_type=product_type, margin_mode=margin_mode,
-                    side=side or "close_long", order_type=order_type, size=size, price=price,
+                data = await gw.futures_place_order_orders([order_payload])
+                return _json_result(data, limit=4000)
+
+            if action_key == "cancel":
+                data = await gw.futures_cancel_orders(
+                    symbol=symbol,
+                    product_type=product_type,
+                    order_id=order_id,
+                    order_ids=order_ids,
+                    cancel_all=cancel_all,
+                    margin_coin=margin_coin,
                 )
-            elif action == "cancel":
-                if not order_id:
-                    return "Error: order_id is required for cancel"
-                data = await gw.futures_cancel_order(symbol=symbol, product_type=product_type, order_id=order_id)
-            else:
-                return f"Error: unknown action '{action}'"
-            return json.dumps(data, ensure_ascii=False)[:4000]
-        except Exception as e:
-            return f"Error: {e}"
+                return _json_result(data, limit=4000)
+
+            return (
+                f"Error: unknown action '{action_key}'. "
+                "Use bitget_uta for full UTA endpoint coverage."
+            )
+        except BitgetError as exc:
+            return f"Error: {exc}"
+        except Exception as exc:
+            return f"Error: bitget_trade action '{action_key}' failed: {exc}"
+        finally:
+            await gw.close()
+
+
+class BitgetUtaTool(Tool):
+    """Generic direct UTA endpoint caller."""
+
+    name = "bitget_uta"
+    description = (
+        "Primary interface for full Bitget UTA REST API coverage. "
+        "Actions: describe (look up required params BEFORE calling), call, list_catalog, check_coverage. "
+        "ALWAYS use describe first for unfamiliar endpoints to see required fields. "
+        "GET → params object. POST/PUT/DELETE → body object. Path must be clean (no query string)."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["call", "describe", "list_catalog", "check_coverage"],
+                "description": "describe: show required/optional params for an endpoint. call: execute. list_catalog: list all endpoints.",
+            },
+            "method": {
+                "type": "string",
+                "enum": ["GET", "POST", "PUT", "DELETE"],
+                "description": "HTTP method, required for action=call",
+            },
+            "path": {
+                "type": "string",
+                "description": (
+                    "Clean Bitget API path WITHOUT query string. "
+                    "Example: /api/v2/mix/order/place-plan-order"
+                ),
+            },
+            "params": {
+                "type": "object",
+                "description": "Query parameters object (for GET requests)",
+            },
+            "body": {
+                "type": "object",
+                "description": (
+                    "JSON body object — REQUIRED for POST/PUT/DELETE. "
+                    "Must contain all mandatory fields per Bitget API docs."
+                ),
+            },
+            "auth_required": {
+                "type": "boolean",
+                "description": "Set false for public endpoints (action=call)",
+                "default": True,
+            },
+        },
+        "required": [],
+    }
+
+    def __init__(self) -> None:
+        self._context: ContextVar[_PrivateBitgetContext] = ContextVar(
+            "bitget_uta_tool_context",
+            default=_PrivateBitgetContext(),
+        )
+
+    def set_context(self, principal_id: str, session_factory: Any) -> None:
+        self._context.set(_PrivateBitgetContext(principal_id=principal_id, session_factory=session_factory))
+
+    async def execute(
+        self,
+        action: str = "call",
+        method: str = "",
+        path: str = "",
+        params: dict[str, Any] | None = None,
+        body: dict[str, Any] | None = None,
+        auth_required: bool = True,
+        **kw: Any,
+    ) -> str:
+        action_key = (action or "call").strip().lower()
+        if action_key == "list_catalog":
+            catalog = list_uta_catalog()
+            return _json_result({"count": len(catalog), "endpoints": catalog}, limit=12000)
+        if action_key == "check_coverage":
+            report = build_uta_coverage_report()
+            return _json_result(report, limit=12000)
+        if action_key == "describe":
+            if not path.strip():
+                return "Error: path is required for action='describe'"
+            info = describe_endpoint(method or "GET", path.strip())
+            if info is None:
+                return (
+                    f"No schema found for {method or '?'} {path}. "
+                    "The endpoint may still work via action='call' — "
+                    "check Bitget docs for required fields."
+                )
+            return _json_result(info, limit=8000)
+        if action_key != "call":
+            return f"Error: unknown action '{action_key}'"
+        if not method.strip() or not path.strip():
+            return "Error: method and path are required for action='call'"
+
+        # All path/body/params sanitisation is handled at gateway level.
+        context = self._context.get()
+        use_auth = bool(auth_required)
+        gateway: BitgetGateway | None = None
+        if use_auth:
+            try:
+                gateway = await _resolve_user_gateway(context.principal_id, context.session_factory)
+            except BitgetError as exc:
+                return f"Error: {exc}"
+            if gateway is None:
+                return f"Error: {_NO_CREDENTIALS_MSG}"
+        else:
+            gateway = BitgetGateway()
+
+        try:
+            query = params if isinstance(params, dict) else None
+            payload = body if isinstance(body, dict) else None
+            data = await gateway.request_uta(
+                method=method.strip().upper(),
+                path=path.strip(),
+                params=query,
+                body=payload,
+                auth_required=use_auth,
+            )
+            return _json_result(data, limit=12000)
+        except BitgetError as exc:
+            return f"Error: {exc}"
+        except Exception as exc:
+            return f"Error: bitget_uta call failed: {exc}"
+        finally:
+            await gateway.close()

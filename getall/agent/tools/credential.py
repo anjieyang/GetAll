@@ -6,9 +6,18 @@ The tool result NEVER contains the raw key material.
 
 from __future__ import annotations
 
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any
 
 from getall.agent.tools.base import Tool
+
+
+@dataclass(frozen=True, slots=True)
+class _CredentialContext:
+    principal_id: str = ""
+    session_factory: Any = None
+    chat_type: str = "private"
 
 
 class CredentialTool(Tool):
@@ -49,9 +58,10 @@ class CredentialTool(Tool):
     }
 
     def __init__(self) -> None:
-        self._principal_id: str = ""
-        self._session_factory: Any = None
-        self._chat_type: str = "private"
+        self._context: ContextVar[_CredentialContext] = ContextVar(
+            "credential_tool_context",
+            default=_CredentialContext(),
+        )
 
     def set_context(
         self,
@@ -60,9 +70,13 @@ class CredentialTool(Tool):
         chat_type: str = "private",
     ) -> None:
         """Called by agent loop before each message."""
-        self._principal_id = principal_id
-        self._session_factory = session_factory
-        self._chat_type = chat_type
+        self._context.set(
+            _CredentialContext(
+                principal_id=principal_id,
+                session_factory=session_factory,
+                chat_type=chat_type,
+            )
+        )
 
     async def execute(
         self,
@@ -73,29 +87,30 @@ class CredentialTool(Tool):
         passphrase: str = "",
         **kw: Any,
     ) -> str:
+        context = self._context.get()
         # ── HARD SECURITY GATE ──
-        if self._chat_type != "private":
+        if context.chat_type != "private":
             return (
                 "Error: credential operations are only allowed in private chats. "
                 "Please DM me directly to bind your exchange account."
             )
 
-        if not self._principal_id:
+        if not context.principal_id:
             return "Error: no identity resolved — cannot manage credentials"
 
-        if self._session_factory is None:
+        if context.session_factory is None:
             return "Error: database session not available"
 
         from getall.storage.repository import CredentialRepo
 
-        async with self._session_factory() as session:
+        async with context.session_factory() as session:
             repo = CredentialRepo(session)
 
             if action == "save":
                 if not api_key or not api_secret or not passphrase:
                     return "Error: api_key, api_secret, and passphrase are all required for save"
                 await repo.save(
-                    principal_id=self._principal_id,
+                    principal_id=context.principal_id,
                     provider=provider,
                     api_key=api_key,
                     api_secret=api_secret,
@@ -105,13 +120,13 @@ class CredentialTool(Tool):
                 return f"Credentials for {provider} saved successfully. You can now use trading features."
 
             elif action == "check":
-                exists = await repo.exists(self._principal_id, provider)
+                exists = await repo.exists(context.principal_id, provider)
                 if exists:
                     return f"Credentials for {provider} are configured. Trading features are available."
                 return f"No credentials found for {provider}. Ask the user to provide API key, secret, and passphrase."
 
             elif action == "delete":
-                deleted = await repo.delete(self._principal_id, provider)
+                deleted = await repo.delete(context.principal_id, provider)
                 await session.commit()
                 if deleted:
                     return f"Credentials for {provider} deleted."

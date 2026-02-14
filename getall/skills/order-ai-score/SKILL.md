@@ -1,6 +1,6 @@
 ---
 name: order-ai-score
-description: "AI-powered position scoring. Evaluate a user's specific position with a comprehensive 0-10 AI reasoning score based on all available market data and position management quality."
+description: "AI-powered position scoring. Evaluate a user's specific position with a comprehensive 0-10 AI reasoning score based on all available market data and position management quality. Use when user says 'AI score', 'evaluate my position', 'rate this trade', '给我评分', or '分析我的仓位'."
 metadata: '{"getall":{"always":false}}'
 ---
 

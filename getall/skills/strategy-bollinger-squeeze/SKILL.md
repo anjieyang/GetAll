@@ -1,6 +1,6 @@
 ---
 name: strategy-bollinger-squeeze
-description: "Bollinger Band squeeze breakout strategy template. Enter when Bollinger Bands squeeze to historical tightness and price breaks out of the band with volume confirmation."
+description: "Bollinger Band squeeze breakout strategy template. Use when user asks about Bollinger squeeze, band squeeze, volatility breakout, low-volatility setup, or 布林带收窄策略."
 metadata: '{"getall":{"always":false}}'
 ---
 

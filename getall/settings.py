@@ -39,7 +39,7 @@ class GetAllSettings(BaseSettings):
     # --- LLM ---
     llm_model: str = "anthropic/claude-3-5-sonnet-latest"
 
-    # --- Bitget (base URL only; credentials are per-user via DB) ---
+    # --- Bitget (direct REST; credentials are per-user via DB) ---
     bitget_base_url: str = "https://api.bitget.com"
 
     # --- credential encryption ---

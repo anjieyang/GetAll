@@ -1,6 +1,6 @@
 ---
 name: strategy-funding-reversal
-description: "Funding rate reversal short strategy template. Short when funding rate is extremely high (crowded longs) and technical indicators confirm overbought conditions."
+description: "Funding rate reversal short strategy template. Use when user asks about funding rate strategy, crowded long short, funding reversal, overbought short, or 资金费率反转做空."
 metadata: '{"getall":{"always":false}}'
 ---
 

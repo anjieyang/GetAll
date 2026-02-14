@@ -11,6 +11,14 @@ from loguru import logger
 from getall.bus.events import InboundMessage, OutboundMessage
 from getall.bus.queue import MessageBus
 from getall.providers.base import LLMProvider
+from getall.providers.voice import (
+    OpenAIVoiceProvider,
+    strip_markdown_for_tts,
+    is_code_heavy,
+    parse_voice_directive,
+    build_voice_options_hint,
+    TTS_MAX_TEXT_LENGTH,
+)
 from getall.agent.context import ContextBuilder
 from getall.agent.tools.registry import ToolRegistry
 from getall.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
@@ -20,12 +28,56 @@ from getall.agent.tools.message import MessageTool
 from getall.agent.tools.spawn import SpawnTool
 from getall.agent.tools.cron import ReminderTool
 from getall.agent.tools.workbench import WorkbenchTool
-from getall.agent.tools.bitget import BitgetMarketTool, BitgetAccountTool, BitgetTradeTool
+from getall.agent.tools.bitget import (
+    BitgetAccountTool,
+    BitgetMarketTool,
+    BitgetTradeTool,
+    BitgetUtaTool,
+)
 from getall.agent.tools.credential import CredentialTool
 from getall.agent.tools.persona import PetPersonaTool
+from getall.trading.data.hub import DataHub
+from getall.trading.tools.backtest import BacktestTool
 from getall.agent.memory import MemoryStore
 from getall.agent.subagent import SubagentManager
-from getall.session.manager import SessionManager
+from getall.session.manager import SessionManager, save_handoff, consume_handoff
+
+# ── Voice mode triggers (substring match) ──
+# System prompt — voice capability section (always injected).
+_VOICE_SECTION_TEMPLATE = """\n
+## Voice Capability
+
+You have built-in voice (TTS/STT). Current voice mode: **{mode}**.
+
+### How mode works
+- **voice mode ON**: Your text reply is automatically converted to speech audio and sent as a voice message.
+- **voice mode OFF**: Normal text replies.
+- When the user sends a voice message, voice mode is auto-enabled.
+
+### You control the mode
+Use your judgment to decide when to switch. Add one of these tags in your reply:
+- `[[voice:on]]` — switch to voice mode (going forward)
+- `[[voice:off]]` — switch back to text mode (going forward)
+- `[[voice:coral]]` — switch to voice mode with a specific voice
+- `[[voice:cedar instructions=用温柔的语气]]` — voice + style control
+
+**When to switch ON**: user asks to "用语音回复", "speak to me", sends audio, or any indication they want voice.
+**When to switch OFF**: user asks to "用文字", "别发语音", "text please", or any indication they prefer text.
+**Use your intelligence** — don't pattern-match keywords; understand the user's intent from context.
+
+{voice_active_section}
+{voice_options}
+"""
+
+_VOICE_ACTIVE_TIPS = """\
+### Voice mode tips (currently ON)
+- Keep replies concise and conversational (≤300 chars ideal).
+- Avoid code blocks, tables, and complex formatting.
+- Speak naturally as if having a face-to-face conversation.
+- Use punctuation for natural pauses in speech.
+- If the answer requires code or long text, reply normally — the system auto-skips TTS for those.
+- Pick a voice that fits the mood by adding `[[voice:name]]` in your reply.
+"""
 
 
 class AgentLoop:
@@ -39,6 +91,11 @@ class AgentLoop:
     4. Executes tool calls
     5. Sends responses back
     """
+
+    _NO_REPLY_RE = re.compile(
+        r"^\s*(?:\[\s*NO_REPLY\s*\]|<\s*NO_REPLY\s*>|NO_REPLY)\s*$",
+        re.IGNORECASE,
+    )
     
     def __init__(
         self,
@@ -46,26 +103,47 @@ class AgentLoop:
         provider: LLMProvider,
         workspace: Path,
         model: str | None = None,
+        max_tokens: int = 65536,
         max_iterations: int = 20,
         memory_window: int = 50,
         brave_api_key: str | None = None,
+        web_search_provider: str = "brave",
+        web_search_api_key: str | None = None,
+        web_search_openai_api_key: str | None = None,
+        web_search_openai_model: str = "gpt-4o-mini",
         exec_config: "ExecToolConfig | None" = None,
         cron_service: "CronService | None" = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
+        trading_config: "TradingConfig | None" = None,
+        max_concurrent_workers: int = 4,
+        reasoning_effort: str = "",
     ):
-        from getall.config.schema import ExecToolConfig
+        from getall.config.schema import ExecToolConfig, TradingConfig
         from getall.cron.service import CronService
         self.bus = bus
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
+        self.max_tokens = max_tokens
         self.max_iterations = max_iterations
         self.memory_window = memory_window
         self.brave_api_key = brave_api_key
+        self.web_search_provider = web_search_provider
+        self.web_search_api_key = (
+            web_search_api_key if web_search_api_key is not None else brave_api_key
+        )
+        self.web_search_openai_api_key = web_search_openai_api_key
+        self.web_search_openai_model = web_search_openai_model
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
+        self.trading_config = trading_config or TradingConfig()
+        self.max_concurrent_workers = max(1, int(max_concurrent_workers))
+        self.reasoning_effort = reasoning_effort
+
+        # Voice provider (lazy: reads GETALL_OPENAI_API_KEY from env).
+        self.voice = OpenAIVoiceProvider()
         
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
@@ -75,21 +153,42 @@ class AgentLoop:
             workspace=workspace,
             bus=bus,
             model=self.model,
+            max_tokens=max_tokens,
             brave_api_key=brave_api_key,
+            web_search_provider=self.web_search_provider,
+            web_search_api_key=self.web_search_api_key,
+            web_search_openai_api_key=self.web_search_openai_api_key,
+            web_search_openai_model=self.web_search_openai_model,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
+            reasoning_effort=reasoning_effort,
         )
         
         self._running = False
+        self._worker_tasks: list[asyncio.Task[None]] = []
+        self._session_locks: dict[str, asyncio.Lock] = {}
+        self._session_lock_refcounts: dict[str, int] = {}
+        self._session_lock_guard = asyncio.Lock()
         self._register_default_tools()
     
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         # File tools (restrict to workspace if configured)
         allowed_dir = self.workspace if self.restrict_to_workspace else None
+        protected_paths = {self.workspace / "SOUL.md"}
         self.tools.register(ReadFileTool(allowed_dir=allowed_dir))
-        self.tools.register(WriteFileTool(allowed_dir=allowed_dir))
-        self.tools.register(EditFileTool(allowed_dir=allowed_dir))
+        self.tools.register(
+            WriteFileTool(
+                allowed_dir=allowed_dir,
+                protected_paths=protected_paths,
+            )
+        )
+        self.tools.register(
+            EditFileTool(
+                allowed_dir=allowed_dir,
+                protected_paths=protected_paths,
+            )
+        )
         self.tools.register(ListDirTool(allowed_dir=allowed_dir))
         
         # Shell tool
@@ -104,11 +203,21 @@ class AgentLoop:
         ))
         
         # Web tools
-        self.tools.register(WebSearchTool(api_key=self.brave_api_key))
+        self.tools.register(
+            WebSearchTool(
+                provider=self.web_search_provider,
+                api_key=self.web_search_api_key,
+                openai_api_key=self.web_search_openai_api_key,
+                openai_model=self.web_search_openai_model,
+            )
+        )
         self.tools.register(WebFetchTool())
         
-        # Message tool
-        message_tool = MessageTool(send_callback=self.bus.publish_outbound)
+        # Message tool (with cross-chat handoff for DM context injection)
+        message_tool = MessageTool(
+            send_callback=self.bus.publish_outbound,
+            handoff_callback=save_handoff,
+        )
         self.tools.register(message_tool)
         
         # Spawn tool (for subagents)
@@ -125,6 +234,8 @@ class AgentLoop:
         self.tools.register(self._bitget_account_tool)
         self._bitget_trade_tool = BitgetTradeTool()
         self.tools.register(self._bitget_trade_tool)
+        self._bitget_uta_tool = BitgetUtaTool()
+        self.tools.register(self._bitget_uta_tool)
 
         # Credential tool (save / check / delete exchange API keys)
         self._credential_tool = CredentialTool()
@@ -133,39 +244,152 @@ class AgentLoop:
         # Pet persona tool
         self._persona_tool = PetPersonaTool()
         self.tools.register(self._persona_tool)
+
+        # Backtest tool (VectorBT engine)
+        try:
+            self._trading_hub = DataHub(self.trading_config, self.workspace)
+            self._backtest_tool = BacktestTool(
+                hub=self._trading_hub,
+                workspace=self.workspace,
+            )
+            self.tools.register(self._backtest_tool)
+        except Exception as e:
+            logger.warning(f"Backtest tool disabled: {e}")
     
-    async def run(self) -> None:
-        """Run the agent loop, processing messages from the bus."""
-        self._running = True
-        logger.info("Agent loop started")
-        
+    @staticmethod
+    def _resolve_system_origin(chat_id: str) -> tuple[str, str]:
+        """Parse system-message chat_id into origin channel/chat pair."""
+        if ":" in chat_id:
+            parts = chat_id.split(":", 1)
+            return parts[0], parts[1]
+        return "cli", chat_id
+
+    def _lock_key_for_message(
+        self,
+        msg: InboundMessage,
+        session_key: str | None = None,
+    ) -> str:
+        """Compute processing lock key.
+
+        Strategy:
+        - Private/system flows: serialize per conversation.
+        - Group flows: serialize per sender within a chat, so different
+          members can run concurrently while one member stays ordered.
+        """
+        if session_key:
+            return session_key
+        if msg.channel == "system":
+            origin_channel, origin_chat_id = self._resolve_system_origin(msg.chat_id)
+            return f"{origin_channel}:{origin_chat_id}"
+        if msg.chat_type == "group":
+            sender = (msg.sender_id or "-").strip() or "-"
+            return f"{msg.channel}:{msg.chat_id}:sender:{sender}"
+        return msg.session_key
+
+    async def _acquire_session_lock(self, lock_key: str) -> asyncio.Lock:
+        """Acquire serialized processing lock for a conversation key."""
+        async with self._session_lock_guard:
+            lock = self._session_locks.get(lock_key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._session_locks[lock_key] = lock
+            self._session_lock_refcounts[lock_key] = (
+                self._session_lock_refcounts.get(lock_key, 0) + 1
+            )
+
+        try:
+            await lock.acquire()
+        except BaseException:
+            async with self._session_lock_guard:
+                refs = self._session_lock_refcounts.get(lock_key, 0) - 1
+                if refs <= 0:
+                    self._session_lock_refcounts.pop(lock_key, None)
+                    current = self._session_locks.get(lock_key)
+                    if current is lock and not lock.locked():
+                        self._session_locks.pop(lock_key, None)
+                else:
+                    self._session_lock_refcounts[lock_key] = refs
+            raise
+        return lock
+
+    async def _release_session_lock(self, lock_key: str, lock: asyncio.Lock) -> None:
+        """Release serialized processing lock and cleanup idle lock entries."""
+        lock.release()
+        async with self._session_lock_guard:
+            refs = self._session_lock_refcounts.get(lock_key, 0) - 1
+            if refs <= 0:
+                self._session_lock_refcounts.pop(lock_key, None)
+                current = self._session_locks.get(lock_key)
+                if current is lock and not current.locked():
+                    self._session_locks.pop(lock_key, None)
+            else:
+                self._session_lock_refcounts[lock_key] = refs
+
+    async def _process_message_with_lock(
+        self,
+        msg: InboundMessage,
+        *,
+        session_key: str | None = None,
+    ) -> OutboundMessage | None:
+        """Serialize same-session messages while allowing cross-session concurrency."""
+        lock_key = self._lock_key_for_message(msg, session_key=session_key)
+        lock = await self._acquire_session_lock(lock_key)
+        try:
+            return await self._process_message(msg, session_key=session_key)
+        finally:
+            await self._release_session_lock(lock_key, lock)
+
+    async def _process_inbound_message(self, msg: InboundMessage) -> None:
+        """Process one inbound message and publish outbound response."""
+        try:
+            response = await self._process_message_with_lock(msg)
+            if response:
+                await self.bus.publish_outbound(response)
+        except Exception as e:
+            logger.error(f"Error processing message: {e}", exc_info=True)
+            # Send user-friendly error (raw details stay in logs)
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="出了点小问题，请稍后再试。如果持续出错请联系管理员。",
+                metadata=msg.metadata or {},
+            ))
+
+    async def _worker_loop(self, worker_id: int) -> None:
+        """Worker loop consuming inbound queue concurrently."""
         while self._running:
             try:
-                # Wait for next message
-                msg = await asyncio.wait_for(
-                    self.bus.consume_inbound(),
-                    timeout=1.0
-                )
-                
-                # Process it
-                try:
-                    response = await self._process_message(msg)
-                    if response:
-                        await self.bus.publish_outbound(response)
-                except Exception as e:
-                    logger.error(f"Error processing message: {e}")
-                    # Send error response
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
-                        content=f"Sorry, I encountered an error: {str(e)}"
-                    ))
+                msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Worker {worker_id} failed to consume inbound: {e}", exc_info=True)
+                continue
+            await self._process_inbound_message(msg)
+
+    async def run(self) -> None:
+        """Run the agent loop with concurrent workers."""
+        self._running = True
+        logger.info(f"Agent loop started with {self.max_concurrent_workers} workers")
+        self._worker_tasks = [
+            asyncio.create_task(self._worker_loop(i + 1))
+            for i in range(self.max_concurrent_workers)
+        ]
+        try:
+            await asyncio.gather(*self._worker_tasks)
+        finally:
+            for task in self._worker_tasks:
+                task.cancel()
+            await asyncio.gather(*self._worker_tasks, return_exceptions=True)
+            self._worker_tasks.clear()
     
     def stop(self) -> None:
-        """Stop the agent loop."""
+        """Stop the agent loop and cancel worker tasks."""
         self._running = False
+        for task in self._worker_tasks:
+            task.cancel()
         logger.info("Agent loop stopping")
     
     @staticmethod
@@ -177,7 +401,144 @@ class AgentLoop:
         if msg.principal_id:
             return f"principal/{tenant}/{msg.principal_id}"
         return f"legacy/{tenant}/{msg.channel}/{msg.chat_id or '-'}"
+
+    @classmethod
+    def _is_no_reply(cls, content: str | None) -> bool:
+        """Return True when model indicates group silence."""
+        if content is None:
+            return True
+        stripped = content.strip()
+        if not stripped:
+            return True
+        return bool(cls._NO_REPLY_RE.match(stripped))
+
+    @staticmethod
+    def _sender_name_for_group(msg: InboundMessage) -> str:
+        """Resolve a stable sender label for group messages."""
+        if msg.chat_type != "group":
+            return ""
+        metadata = msg.metadata or {}
+        sender_name = str(
+            msg.sender_name or metadata.get("sender_name") or ""
+        ).strip()
+        if sender_name:
+            return sender_name
+        return str(msg.sender_id or "").strip()
+
+    @classmethod
+    def _format_current_user_content(cls, msg: InboundMessage) -> str:
+        """Prefix current user turn with sender name in groups."""
+        sender_name = cls._sender_name_for_group(msg)
+        if not sender_name:
+            return msg.content
+        return f"[{sender_name}] {msg.content}"
+
+    @staticmethod
+    def _inject_group_reply_policy(
+        msg: InboundMessage,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        """Inject per-message group reply policy into system prompt."""
+        if msg.chat_type != "group" or not messages:
+            return
+        if messages[0].get("role") != "system":
+            return
+
+        metadata = msg.metadata or {}
+        bot_was_mentioned = bool(metadata.get("bot_was_mentioned"))
+        ambient_probe = bool(metadata.get("ambient_probe"))
+        if bot_was_mentioned:
+            messages[0]["content"] += f"""
+
+## Group Reply Decision
+Current trigger: direct_mention
+- This is a strong trigger, so you MUST reply.
+- Never output [NO_REPLY] for direct mentions.
+- Keep it concise and useful; if intent is unclear, ask one short clarifying question."""
+            return
+        if ambient_probe:
+            messages[0]["content"] += """
+
+## Group Reply Decision
+Current trigger: ambient_probe
+- This is a rare non-@ probe. Do NOT always reply.
+- Only reply when you can add clear value to the current group context.
+- If you reply, keep it within 1-2 short sentences (casual, low-noise).
+- If not worth replying, output EXACTLY: [NO_REPLY]."""
+            return
+        messages[0]["content"] += """
+
+## Group Reply Decision
+Current trigger: ambient_listener
+- Use your judgment, not rigid keyword matching.
+- Reply naturally when the user clearly expects you, when this is a follow-up to your recent reply, or when you can add clear value.
+- If replying would create noise (side chat, casual banter, emoji-only, no real ask), output EXACTLY: [NO_REPLY]
+- For ambient listening (not mentioned), stay restrained. If uncertain, choose [NO_REPLY]."""
     
+    # ── voice mode helpers ──
+
+    async def _transcribe_audio(self, msg: InboundMessage) -> str:
+        """Transcribe audio from an inbound message.  Returns text or ''."""
+        audio_path = (msg.metadata or {}).get("audio_path", "")
+        if not audio_path:
+            # Also check media list for audio files.
+            for m in msg.media:
+                if m.endswith((".ogg", ".opus", ".mp3", ".wav", ".m4a")):
+                    audio_path = m
+                    break
+        if not audio_path:
+            return ""
+        if not self.voice.available:
+            logger.warning("Voice provider not available (no OpenAI API key)")
+            return ""
+
+        text = await self.voice.stt(Path(audio_path))
+        if text:
+            logger.info(f"STT transcription: {text[:80]}")
+        return text
+
+    async def _maybe_tts(self, text: str, directive: Any = None) -> str:
+        """Convert text to speech if feasible.
+
+        Args:
+            text: Already-cleaned text (no [[voice:...]] tags).
+            directive: Pre-parsed VoiceDirective or None.
+
+        Returns:
+            Audio file path, or '' if TTS was skipped.
+        """
+        if not self.voice.available:
+            return ""
+        # Skip TTS for code-heavy or very long responses.
+        if is_code_heavy(text):
+            logger.debug("Skipping TTS: code-heavy response")
+            return ""
+        if len(text) > TTS_MAX_TEXT_LENGTH:
+            logger.debug(f"Skipping TTS: text too long ({len(text)} chars)")
+            return ""
+
+        voice: str | None = None
+        instructions: str | None = None
+        if directive:
+            voice = directive.voice
+            instructions = directive.instructions or None
+            logger.info(f"Voice directive: voice={voice}, instructions={instructions!r}")
+
+        # Prepare text for speech synthesis.
+        clean = strip_markdown_for_tts(text)
+        if len(clean) < 2:
+            return ""
+        try:
+            path = await self.voice.tts(
+                clean,
+                voice=voice,
+                instructions=instructions,
+            )
+            return str(path)
+        except Exception as exc:
+            logger.error(f"TTS failed: {exc}")
+            return ""
+
     async def _process_message(self, msg: InboundMessage, session_key: str | None = None) -> OutboundMessage | None:
         """
         Process a single inbound message.
@@ -194,11 +555,50 @@ class AgentLoop:
         if msg.channel == "system":
             return await self._process_system_message(msg)
         
+        # ── Voice: STT for incoming audio messages ──
+        is_audio_msg = bool((msg.metadata or {}).get("is_audio"))
+        if is_audio_msg and not msg.content:
+            transcribed = await self._transcribe_audio(msg)
+            if transcribed:
+                msg.content = transcribed
+            else:
+                msg.content = "（语音消息，未能识别）"
+                logger.warning("Failed to transcribe voice message")
+
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}: {preview}")
         
         # Get or create session
         session = self.sessions.get_or_create(session_key or msg.session_key)
+
+        # ── Voice mode management ──
+        # Auto-enable voice mode when user sends audio (objective detection).
+        if is_audio_msg:
+            session.metadata["voice_mode"] = True
+            logger.info("Voice mode auto-enabled (user sent audio)")
+        # NOTE: text-based on/off is NOT keyword-matched here.
+        # The agent decides and emits [[voice:on]]/[[voice:off]] in its reply.
+
+        # ── Cross-chat handoff injection ──
+        # If the agent proactively DM'd this user from a group chat earlier,
+        # inject the sent messages into this session so the agent has context.
+        if msg.channel and msg.chat_id:
+            handoff_msgs = consume_handoff(msg.channel, msg.chat_id)
+            if handoff_msgs:
+                for hm in handoff_msgs:
+                    session.add_message(
+                        hm.get("role", "assistant"),
+                        hm.get("content", ""),
+                    )
+                self.sessions.save(session)
+                logger.info(
+                    f"Injected {len(handoff_msgs)} handoff message(s) into "
+                    f"session {session.key}"
+                )
+
+        # Always reset persona tool context first so any failure path below
+        # cannot accidentally reuse stale private/group bindings.
+        self._persona_tool.clear_context()
         
         # Update tool contexts
         message_tool = self.tools.get("message")
@@ -226,13 +626,23 @@ class AgentLoop:
             if not msg.principal_id:
                 async with factory() as db_session:
                     hook = IdentityRouterHook(db_session)
+                    # Group chats must have an identity independent from any
+                    # individual user. We key group identity by chat_id and
+                    # disable IFT extraction from group message text.
+                    resolver_user_id = msg.sender_id
+                    resolver_message_text = msg.content
+                    if is_group:
+                        resolver_user_id = (
+                            f"group:{msg.tenant_id or 'default'}:{msg.chat_id or '-'}"
+                        )
+                        resolver_message_text = ""
                     resolution = await hook.resolve(
                         tenant_id=msg.tenant_id or "default",
                         channel=msg.channel,
                         chat_id=msg.chat_id,
-                        user_id=msg.sender_id,
+                        user_id=resolver_user_id,
                         thread_id=msg.thread_id,
-                        message_text=msg.content,
+                        message_text=resolver_message_text,
                     )
                     await db_session.commit()
                     msg.principal_id = resolution.principal_id
@@ -271,6 +681,7 @@ class AgentLoop:
                 self._credential_tool.set_context(msg.principal_id, factory, msg.chat_type)
                 self._bitget_account_tool.set_context(msg.principal_id, factory)
                 self._bitget_trade_tool.set_context(msg.principal_id, factory)
+                self._bitget_uta_tool.set_context(msg.principal_id, factory)
         except Exception as e:
             logger.warning(f"Identity/persona resolution failed: {e}")
 
@@ -285,31 +696,80 @@ class AgentLoop:
                 sender_id=msg.sender_id,
                 thread_id=msg.thread_id,
                 chat_type=msg.chat_type,
+                synthetic=bool((msg.metadata or {}).get("synthetic")),
+                source=str((msg.metadata or {}).get("source", "")),
             )
+
+        # Persist per-principal route so cron/WS can deliver to this user later.
+        # Private and group routes are stored separately — monitoring always
+        # uses the private route so personal data is never leaked to groups.
+        if msg.principal_id:
+            from getall.routing import save_last_route
+            save_last_route(msg.channel, msg.chat_id, msg.principal_id, msg.chat_type)
 
         memory_scope = self._resolve_memory_scope(msg)
         session.metadata["memory_scope"] = memory_scope
+
+        # ── Group persona: load from file and enable persona tool ──
+        if is_group:
+            group_persona_path = self.workspace / "memory" / memory_scope / "persona.json"
+            group_persona = PetPersonaTool.load_group_persona(group_persona_path)
+            if group_persona:
+                persona = persona or {}
+                persona["pet_name"] = group_persona.get("pet_name", "")
+                persona["persona_text"] = group_persona.get("persona_text", "")
+                persona["trading_style_text"] = group_persona.get("trading_style_text", "")
+            self._persona_tool.set_group_context(group_persona_path)
 
         # Consolidate memory with correct scope once identity/session metadata are ready.
         if len(session.messages) > self.memory_window:
             await self._consolidate_memory(session)
         
         # Build initial messages (use get_history for LLM-formatted messages)
+        # For audio messages, exclude audio file paths from media sent to LLM.
+        llm_media = [
+            m for m in (msg.media or [])
+            if not m.endswith((".ogg", ".opus", ".mp3", ".wav", ".m4a"))
+        ] or None
         messages = self.context.build_messages(
             history=session.get_history(),
-            current_message=msg.content,
-            media=msg.media if msg.media else None,
+            current_message=self._format_current_user_content(msg),
+            media=llm_media,
             channel=msg.channel,
             chat_id=msg.chat_id,
             chat_type=msg.chat_type,
             persona=persona,
             memory_scope=memory_scope,
         )
+
+        # Inject voice capability section into system prompt (always).
+        voice_mode_active = session.metadata.get("voice_mode", False)
+        if self.voice.available and messages and messages[0].get("role") == "system":
+            mode_label = "ON" if voice_mode_active else "OFF"
+            voice_section = _VOICE_SECTION_TEMPLATE.format(
+                mode=mode_label,
+                voice_active_section=_VOICE_ACTIVE_TIPS if voice_mode_active else "",
+                voice_options=build_voice_options_hint(),
+            )
+            messages[0]["content"] += voice_section
+
+        # Inject group member list so the agent knows who's in the chat
+        group_members = (msg.metadata or {}).get("group_members", [])
+        if group_members and messages and messages[0].get("role") == "system":
+            names = ", ".join(group_members)
+            messages[0]["content"] += (
+                f"\n\n## Group Members (from API)\n"
+                f"This group has {len(group_members)} members: {names}\n"
+                f"This is the complete member list from the Lark API, not just people who have spoken."
+            )
+            logger.debug(f"Injected {len(group_members)} group members into context: {names}")
+        self._inject_group_reply_policy(msg, messages)
         
         # Agent loop
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        autofix_hints_sent = 0
         
         while iteration < self.max_iterations:
             iteration += 1
@@ -318,9 +778,17 @@ class AgentLoop:
             response = await self.provider.chat(
                 messages=messages,
                 tools=self.tools.get_definitions(),
-                model=self.model
+                model=self.model,
+                max_tokens=self.max_tokens,
+                reasoning_effort=self.reasoning_effort,
             )
             
+            # LLM error → stop loop, use error message as final response
+            if response.finish_reason == "error":
+                final_content = response.content
+                logger.warning(f"LLM returned error (iteration {iteration}): {final_content}")
+                break
+
             # Handle tool calls
             if response.has_tool_calls:
                 # Add assistant message with tool calls
@@ -349,14 +817,73 @@ class AgentLoop:
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
+                    hint = self._build_autofix_hint(tool_call.name, result)
+                    if hint and autofix_hints_sent < 2:
+                        messages.append({"role": "system", "content": hint})
+                        autofix_hints_sent += 1
             else:
                 # No tool calls, we're done
                 final_content = response.content
                 break
         
         if final_content is None:
-            final_content = "I've completed processing but have no response to give."
-        
+            # Exhausted max_iterations with every round being tool calls.
+            # Make one final LLM call WITHOUT tools to force a text summary.
+            logger.warning(
+                f"Agent loop exhausted {self.max_iterations} iterations without "
+                "a final text response; forcing summary call"
+            )
+            messages.append({
+                "role": "system",
+                "content": (
+                    "You have used all available tool-call rounds. "
+                    "Now give the user a concise final answer based on "
+                    "everything you've gathered so far. Do NOT call any tools."
+                ),
+            })
+            try:
+                summary_resp = await self.provider.chat(
+                    messages=messages,
+                    tools=None,
+                    model=self.model,
+                    max_tokens=self.max_tokens,
+                    reasoning_effort=self.reasoning_effort,
+                )
+                final_content = (summary_resp.content or "").strip()
+            except Exception as exc:
+                logger.error(f"Summary call failed after loop exhaustion: {exc}")
+            if not final_content:
+                final_content = "处理完成，但未能生成最终回复，请再试一次。"
+
+        metadata = msg.metadata or {}
+        strong_trigger = bool(metadata.get("bot_was_mentioned"))
+        if is_group and strong_trigger and self._is_no_reply(final_content):
+            logger.warning(
+                "Model returned NO_REPLY on strong group trigger; applying fallback reply"
+            )
+            final_content = "我在，收到。你继续说，我马上处理。"
+
+        suppress_group_reply = (
+            is_group and (not strong_trigger) and self._is_no_reply(final_content)
+        )
+        if suppress_group_reply:
+            logger.info(
+                "Suppressing group outbound by model decision: "
+                f"{msg.channel}:{msg.chat_id}"
+            )
+
+        # Parse [[voice:...]] directive — always, since agent may switch mode.
+        _voice_directive = None
+        if final_content:
+            final_content, _voice_directive = parse_voice_directive(final_content)
+            # Apply mode switch from agent's directive.
+            if _voice_directive and _voice_directive.mode_switch:
+                new_mode = _voice_directive.mode_switch == "on"
+                if new_mode != voice_mode_active:
+                    session.metadata["voice_mode"] = new_mode
+                    voice_mode_active = new_mode
+                    logger.info(f"Voice mode {'ON' if new_mode else 'OFF'} (agent directive)")
+
         # Log response preview
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info(f"Response to {msg.channel}:{msg.sender_id}: {preview}")
@@ -364,10 +891,25 @@ class AgentLoop:
         # Save to session (include tool names so consolidation sees what happened)
         is_synthetic_event = bool((msg.metadata or {}).get("synthetic"))
         if not is_synthetic_event:
-            session.add_message("user", msg.content)
-        session.add_message("assistant", final_content,
-                            tools_used=tools_used if tools_used else None)
+            user_message: dict[str, Any] = {"chat_type": msg.chat_type}
+            if is_audio_msg:
+                user_message["voice"] = True
+            if is_group:
+                user_message["sender_id"] = msg.sender_id
+                sender_name = self._sender_name_for_group(msg)
+                if sender_name:
+                    user_message["sender_name"] = sender_name
+            session.add_message("user", msg.content, **user_message)
+        if not suppress_group_reply:
+            session.add_message(
+                "assistant",
+                final_content,
+                tools_used=tools_used if tools_used else None,
+            )
         self.sessions.save(session)
+
+        if suppress_group_reply:
+            return None
 
         # If the agent already sent messages via the message tool TO THE SAME CHAT,
         # suppress the final outbound to avoid duplicate output.
@@ -385,15 +927,36 @@ class AgentLoop:
         # Extract generated image paths from tool results in the conversation
         media = self._extract_generated_images(messages)
 
+        # ── Voice: TTS for outbound when voice mode is active ──
+        audio_path = ""
+        if voice_mode_active and final_content:
+            audio_path = await self._maybe_tts(final_content, _voice_directive)
+            if audio_path:
+                logger.info(f"TTS generated: {audio_path}")
+
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
             content=final_content,
             media=media,
             metadata=msg.metadata or {},  # Pass through for channel-specific needs (e.g. Slack thread_ts)
+            audio_path=audio_path,
         )
     
     _GENERATED_IMAGE_RE = re.compile(r"\[GENERATED_IMAGE:(.*?)\]")
+    _AUTOFIX_ERROR_PATTERNS = (
+        "command not found",
+        "not configured",
+        "no module named",
+        "module not found",
+        "tool '",
+        "missing required",
+        "permission denied",
+        "timed out",
+        "blocked by safety guard",
+        "outside allowed directory",
+        "error: script not found",
+    )
 
     @classmethod
     def _extract_generated_images(cls, messages: list[dict[str, Any]]) -> list[str]:
@@ -409,6 +972,25 @@ class AgentLoop:
                     paths.append(fpath)
         return paths
 
+    @classmethod
+    def _build_autofix_hint(cls, tool_name: str, result: str) -> str | None:
+        text = (result or "").lower()
+        if not text:
+            return None
+        if not (text.startswith("error") or "stderr:" in text):
+            return None
+        if not any(p in text for p in cls._AUTOFIX_ERROR_PATTERNS):
+            return None
+        return (
+            "Tool execution failed due to missing capability/setup. "
+            "Autonomously self-heal: (1) use web_search (prefer DuckDuckGo and reputable skill/tool registries "
+            "like clawhub.ai, smithery.ai, MCP registry, GitHub), "
+            "(2) install or create a reusable shared capability with workbench, "
+            "(3) retry the original task immediately, "
+            "(4) report to user in one concise natural-language line what was installed. "
+            "For privileged actions, ask for one explicit confirmation first."
+        )
+
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
         Process a system message (e.g., subagent announce).
@@ -419,14 +1001,7 @@ class AgentLoop:
         logger.info(f"Processing system message from {msg.sender_id}")
         
         # Parse origin from chat_id (format: "channel:chat_id")
-        if ":" in msg.chat_id:
-            parts = msg.chat_id.split(":", 1)
-            origin_channel = parts[0]
-            origin_chat_id = parts[1]
-        else:
-            # Fallback
-            origin_channel = "cli"
-            origin_chat_id = msg.chat_id
+        origin_channel, origin_chat_id = self._resolve_system_origin(msg.chat_id)
         
         # Use the origin session for context
         session_key = f"{origin_channel}:{origin_chat_id}"
@@ -468,8 +1043,15 @@ class AgentLoop:
             response = await self.provider.chat(
                 messages=messages,
                 tools=self.tools.get_definitions(),
-                model=self.model
+                model=self.model,
+                max_tokens=self.max_tokens,
+                reasoning_effort=self.reasoning_effort,
             )
+
+            if response.finish_reason == "error":
+                final_content = response.content
+                logger.warning(f"LLM error in system handler (iter {iteration}): {final_content}")
+                break
             
             if response.has_tool_calls:
                 tool_call_dicts = [
@@ -532,8 +1114,18 @@ class AgentLoop:
         for m in old_messages:
             if not m.get("content"):
                 continue
+            speaker = ""
+            if m.get("role") == "user" and str(m.get("chat_type", "")) == "group":
+                sender_name = str(
+                    m.get("sender_name") or m.get("sender_id") or ""
+                ).strip()
+                if sender_name:
+                    speaker = f" [{sender_name}]"
             tools = f" [tools: {', '.join(m['tools_used'])}]" if m.get("tools_used") else ""
-            lines.append(f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}")
+            lines.append(
+                f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}"
+                f"{speaker}{tools}: {m['content']}"
+            )
         conversation = "\n".join(lines)
         current_memory = memory.read_long_term()
 
@@ -592,6 +1184,7 @@ Respond with ONLY valid JSON, no markdown fences."""
         agent_identity_id: str = "",
         thread_id: str = "",
         chat_type: str = "private",
+        metadata: dict[str, Any] | None = None,
     ) -> str:
         """
         Process a message directly (for CLI or reminders usage).
@@ -621,7 +1214,8 @@ Respond with ONLY valid JSON, no markdown fences."""
             agent_identity_id=agent_identity_id,
             thread_id=thread_id,
             chat_type=chat_type,
+            metadata=metadata or {},
         )
         
-        response = await self._process_message(msg, session_key=session_key)
+        response = await self._process_message_with_lock(msg, session_key=session_key)
         return response.content if response else ""

@@ -28,6 +28,41 @@ def _normalize_job_name(name: str) -> str:
     return re.sub(r"[-\s]+", "_", name.lower().strip())
 
 
+def _normalize_scope_value(value: str | None, default: str = "") -> str:
+    """Normalize identity-scope values to comparable strings."""
+    if value is None:
+        return default
+    v = str(value).strip()
+    return v if v else default
+
+
+def _job_scope_matches(
+    job: CronJob,
+    *,
+    tenant_id: str,
+    principal_id: str,
+    channel: str | None,
+    to: str | None,
+    thread_id: str | None,
+    chat_type: str | None,
+) -> bool:
+    """Return True only when a job belongs to the same isolation scope."""
+    return (
+        _normalize_scope_value(job.payload.tenant_id, "default")
+        == _normalize_scope_value(tenant_id, "default")
+        and _normalize_scope_value(job.payload.principal_id)
+        == _normalize_scope_value(principal_id)
+        and _normalize_scope_value(job.payload.channel)
+        == _normalize_scope_value(channel)
+        and _normalize_scope_value(job.payload.to)
+        == _normalize_scope_value(to)
+        and _normalize_scope_value(job.payload.thread_id)
+        == _normalize_scope_value(thread_id)
+        and _normalize_scope_value(job.payload.chat_type, "private")
+        == _normalize_scope_value(chat_type, "private")
+    )
+
+
 def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
     """Compute next run time in ms."""
     if schedule.kind == "at":
@@ -448,31 +483,55 @@ class CronService:
         thread_id: str = "",
         chat_type: str = "private",
     ) -> CronJob:
-        """Add a job (idempotent – updates existing job with same normalized name)."""
+        """Add a job (idempotent inside the same identity/chat scope)."""
         store = self._load_store()
         now = _now_ms()
         normalized = _normalize_job_name(name)
+        normalized_payload_kind = (
+            payload_kind
+            if payload_kind in {"agent_turn", "direct_message", "system_event"}
+            else "agent_turn"
+        )
 
-        # Idempotent: update existing job with same name
+        # Idempotent update is scope-aware to avoid cross-user/group overwrite.
         for existing in store.jobs:
-            if _normalize_job_name(existing.name) == normalized:
-                existing.name = name
-                existing.schedule = schedule
-                existing.payload.message = message
-                existing.payload.deliver = deliver
-                existing.payload.channel = channel
-                existing.payload.to = to
-                existing.payload.final_message = final_message
-                existing.enabled = True
-                existing.updated_at_ms = now
-                existing.state.next_run_at_ms = _compute_next_run(schedule, now)
-                existing.delete_after_run = delete_after_run
-                if max_runs is not None and max_runs > 0:
-                    existing.max_runs = max_runs
-                self._save_store()
-                self._arm_timer()
-                logger.info(f"Cron: updated existing '{name}' ({existing.id})")
-                return existing
+            if _normalize_job_name(existing.name) != normalized:
+                continue
+            if not _job_scope_matches(
+                existing,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                channel=channel,
+                to=to,
+                thread_id=thread_id,
+                chat_type=chat_type,
+            ):
+                continue
+
+            existing.name = name
+            existing.schedule = schedule
+            existing.payload.kind = normalized_payload_kind
+            existing.payload.message = message
+            existing.payload.deliver = deliver
+            existing.payload.channel = channel
+            existing.payload.to = to
+            existing.payload.final_message = final_message
+            existing.payload.tenant_id = tenant_id or "default"
+            existing.payload.principal_id = principal_id or ""
+            existing.payload.agent_identity_id = agent_identity_id or ""
+            existing.payload.sender_id = sender_id or ""
+            existing.payload.thread_id = thread_id or ""
+            existing.payload.chat_type = chat_type or "private"
+            existing.enabled = True
+            existing.updated_at_ms = now
+            existing.state.next_run_at_ms = _compute_next_run(schedule, now)
+            existing.delete_after_run = delete_after_run
+            if max_runs is not None and max_runs > 0:
+                existing.max_runs = max_runs
+            self._save_store()
+            self._arm_timer()
+            logger.info(f"Cron: updated existing '{name}' ({existing.id})")
+            return existing
 
         normalized_max_runs = max_runs if isinstance(max_runs, int) and max_runs > 0 else None
         job = CronJob(
@@ -481,7 +540,7 @@ class CronService:
             enabled=True,
             schedule=schedule,
             payload=CronPayload(
-                kind=payload_kind if payload_kind in {"agent_turn", "direct_message", "system_event"} else "agent_turn",
+                kind=normalized_payload_kind,
                 message=message,
                 deliver=deliver,
                 channel=channel,

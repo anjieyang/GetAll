@@ -1,6 +1,6 @@
 ---
 name: trade-journal
-description: "Trade recording and review. Log trades to trades.jsonl, generate review reports, track win rates, discover patterns, and extract lessons from trading history."
+description: "Trade recording and review. Log trades to trades.jsonl, generate review reports, track win rates, discover patterns, and extract lessons. Use when user says '记录交易', 'review this week/month', '复盘', 'how did I do', or reports opening/closing a trade."
 metadata: '{"getall":{"always":false}}'
 ---
 

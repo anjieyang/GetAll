@@ -60,8 +60,15 @@ class ReadFileTool(Tool):
 class WriteFileTool(Tool):
     """Tool to write content to a file."""
     
-    def __init__(self, allowed_dir: Path | None = None):
+    def __init__(
+        self,
+        allowed_dir: Path | None = None,
+        protected_paths: set[Path] | None = None,
+    ):
         self._allowed_dir = allowed_dir
+        self._protected_paths = {
+            p.expanduser().resolve() for p in (protected_paths or set())
+        }
 
     @property
     def name(self) -> str:
@@ -91,6 +98,8 @@ class WriteFileTool(Tool):
     async def execute(self, path: str, content: str, **kwargs: Any) -> str:
         try:
             file_path = _resolve_path(path, self._allowed_dir)
+            if file_path in self._protected_paths:
+                return f"Error: write denied for protected file: {file_path}"
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(content, encoding="utf-8")
             return f"Successfully wrote {len(content)} bytes to {path}"
@@ -103,8 +112,15 @@ class WriteFileTool(Tool):
 class EditFileTool(Tool):
     """Tool to edit a file by replacing text."""
     
-    def __init__(self, allowed_dir: Path | None = None):
+    def __init__(
+        self,
+        allowed_dir: Path | None = None,
+        protected_paths: set[Path] | None = None,
+    ):
         self._allowed_dir = allowed_dir
+        self._protected_paths = {
+            p.expanduser().resolve() for p in (protected_paths or set())
+        }
 
     @property
     def name(self) -> str:
@@ -138,6 +154,8 @@ class EditFileTool(Tool):
     async def execute(self, path: str, old_text: str, new_text: str, **kwargs: Any) -> str:
         try:
             file_path = _resolve_path(path, self._allowed_dir)
+            if file_path in self._protected_paths:
+                return f"Error: edit denied for protected file: {file_path}"
             if not file_path.exists():
                 return f"Error: File not found: {path}"
             

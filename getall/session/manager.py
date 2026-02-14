@@ -3,12 +3,108 @@
 import json
 from pathlib import Path
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from loguru import logger
 
 from getall.utils.helpers import ensure_dir, safe_filename
+
+
+# ── Cross-chat handoff persistence ─────────────────────────────────
+#
+# When the agent proactively DMs a user from a group chat, the sent
+# message must appear in the *target* private session so the user's
+# reply has context.  We persist a lightweight handoff file keyed by
+# channel + target chat_id.  The next incoming message on that chat
+# consumes the handoff and injects it into the session.
+
+_HANDOFF_DIR = "handoffs"
+_HANDOFF_TTL = timedelta(hours=24)
+
+
+def _handoff_dir() -> Path:
+    d = Path.home() / ".getall" / "data" / _HANDOFF_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _handoff_path(channel: str, chat_id: str) -> Path:
+    safe = safe_filename(f"{channel}_{chat_id}")
+    return _handoff_dir() / f"{safe}.json"
+
+
+def save_handoff(
+    channel: str,
+    target_chat_id: str,
+    content: str,
+    source_channel: str,
+    source_chat_id: str,
+) -> None:
+    """Persist a cross-chat handoff message for later injection.
+
+    Called by MessageTool when sending to a chat_id that differs from
+    the current conversation context (e.g. a proactive DM from group).
+    """
+    path = _handoff_path(channel, target_chat_id)
+    data: dict[str, Any] = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    messages: list[dict[str, Any]] = data.get("messages", [])
+    messages.append({
+        "role": "assistant",
+        "content": content,
+        "timestamp": datetime.now().isoformat(),
+    })
+    data = {
+        "messages": messages,
+        "source_channel": source_channel,
+        "source_chat_id": source_chat_id,
+        "updated_at": datetime.now().isoformat(),
+    }
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.debug(
+        f"Handoff saved: {channel}:{target_chat_id} "
+        f"(from {source_channel}:{source_chat_id}, {len(messages)} msg(s))"
+    )
+
+
+def consume_handoff(channel: str, chat_id: str) -> list[dict[str, Any]] | None:
+    """Consume a pending handoff for the given chat.
+
+    Returns the list of assistant messages to inject, or None if no
+    handoff exists (or it has expired).
+    """
+    path = _handoff_path(channel, chat_id)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        path.unlink(missing_ok=True)
+
+        # TTL check — ignore stale handoffs
+        updated = data.get("updated_at", "")
+        if updated:
+            age = datetime.now() - datetime.fromisoformat(updated)
+            if age > _HANDOFF_TTL:
+                logger.debug(f"Discarding stale handoff for {channel}:{chat_id} (age={age})")
+                return None
+
+        messages = data.get("messages", [])
+        if messages:
+            logger.info(
+                f"Consuming handoff for {channel}:{chat_id} "
+                f"({len(messages)} msg(s) from {data.get('source_channel')}:{data.get('source_chat_id')})"
+            )
+        return messages or None
+    except Exception as exc:
+        logger.warning(f"Failed to consume handoff for {channel}:{chat_id}: {exc}")
+        path.unlink(missing_ok=True)
+        return None
 
 
 @dataclass
@@ -36,6 +132,20 @@ class Session:
         }
         self.messages.append(msg)
         self.updated_at = datetime.now()
+
+    @staticmethod
+    def _format_history_message(message: dict[str, Any]) -> dict[str, str]:
+        """Format a stored message for LLM history consumption."""
+        role = str(message.get("role", "user"))
+        content = str(message.get("content", ""))
+        if role != "user" or str(message.get("chat_type", "")) != "group":
+            return {"role": role, "content": content}
+        sender_name = str(
+            message.get("sender_name") or message.get("sender_id") or ""
+        ).strip()
+        if not sender_name:
+            return {"role": role, "content": content}
+        return {"role": role, "content": f"[{sender_name}] {content}"}
 
     def add_tool_execution(
         self,
@@ -72,7 +182,7 @@ class Session:
             recent tool execution context.
         """
         recent = self.messages[-max_messages:] if len(self.messages) > max_messages else self.messages
-        history = [{"role": m["role"], "content": m["content"]} for m in recent]
+        history = [self._format_history_message(m) for m in recent]
 
         # Prepend tool-execution context if available
         if self.tool_executions:

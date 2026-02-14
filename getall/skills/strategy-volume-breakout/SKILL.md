@@ -1,6 +1,6 @@
 ---
 name: strategy-volume-breakout
-description: "Volume breakout tracking strategy template. Enter when price breaks key resistance with significant volume expansion and OI confirmation."
+description: "Volume breakout tracking strategy template. Use when user asks about breakout strategy, volume breakout, resistance breakout, momentum entry, or 放量突破策略."
 metadata: '{"getall":{"always":false}}'
 ---
 

@@ -1,5 +1,7 @@
 """Reminders tool backed by cron scheduling."""
 
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any
 
 from getall.agent.tools.base import Tool
@@ -7,19 +9,29 @@ from getall.cron.service import CronService
 from getall.cron.types import CronSchedule
 
 
+@dataclass(frozen=True, slots=True)
+class _ReminderContext:
+    channel: str = ""
+    chat_id: str = ""
+    tenant_id: str = "default"
+    principal_id: str = ""
+    agent_identity_id: str = ""
+    sender_id: str = ""
+    thread_id: str = ""
+    chat_type: str = "private"
+    synthetic: bool = False
+    source: str = ""
+
+
 class ReminderTool(Tool):
     """Tool to create/list/remove reminders and scheduled tasks."""
     
     def __init__(self, cron_service: CronService):
         self._cron = cron_service
-        self._channel = ""
-        self._chat_id = ""
-        self._tenant_id = "default"
-        self._principal_id = ""
-        self._agent_identity_id = ""
-        self._sender_id = ""
-        self._thread_id = ""
-        self._chat_type = "private"
+        self._context: ContextVar[_ReminderContext] = ContextVar(
+            "reminder_tool_context",
+            default=_ReminderContext(),
+        )
     
     def set_context(
         self,
@@ -32,16 +44,24 @@ class ReminderTool(Tool):
         sender_id: str = "",
         thread_id: str = "",
         chat_type: str = "private",
+        synthetic: bool = False,
+        source: str = "",
     ) -> None:
         """Set the current session + identity context for delivery/isolation."""
-        self._channel = channel
-        self._chat_id = chat_id
-        self._tenant_id = tenant_id or "default"
-        self._principal_id = principal_id or ""
-        self._agent_identity_id = agent_identity_id or ""
-        self._sender_id = sender_id or ""
-        self._thread_id = thread_id or ""
-        self._chat_type = chat_type or "private"
+        self._context.set(
+            _ReminderContext(
+                channel=channel,
+                chat_id=chat_id,
+                tenant_id=tenant_id or "default",
+                principal_id=principal_id or "",
+                agent_identity_id=agent_identity_id or "",
+                sender_id=sender_id or "",
+                thread_id=thread_id or "",
+                chat_type=chat_type or "private",
+                synthetic=synthetic,
+                source=source or "",
+            )
+        )
     
     @property
     def name(self) -> str:
@@ -152,9 +172,15 @@ class ReminderTool(Tool):
     ) -> str:
         if not message:
             return "Error: message is required for add"
-        if not self._channel or not self._chat_id:
+        context = self._context.get()
+        if context.synthetic and context.source == "cron":
+            return (
+                "Error: reminder creation is blocked inside a cron-triggered run "
+                "to prevent recursive scheduling loops."
+            )
+        if not context.channel or not context.chat_id:
             return "Error: no session context (channel/chat_id)"
-        if not self._principal_id:
+        if not context.principal_id:
             return "Error: no principal identity context for reminder creation"
         
         # Build schedule
@@ -181,17 +207,17 @@ class ReminderTool(Tool):
             message=message,
             deliver=True,
             payload_kind="direct_message" if mode != "agent" else "agent_turn",
-            channel=self._channel,
-            to=self._chat_id,
+            channel=context.channel,
+            to=context.chat_id,
             delete_after_run=delete_after,
             max_runs=max_runs,
             final_message=final_message,
-            tenant_id=self._tenant_id,
-            principal_id=self._principal_id,
-            agent_identity_id=self._agent_identity_id,
-            sender_id=self._sender_id,
-            thread_id=self._thread_id,
-            chat_type=self._chat_type,
+            tenant_id=context.tenant_id,
+            principal_id=context.principal_id,
+            agent_identity_id=context.agent_identity_id,
+            sender_id=context.sender_id,
+            thread_id=context.thread_id,
+            chat_type=context.chat_type,
         )
         if job.max_runs:
             return (
@@ -204,11 +230,11 @@ class ReminderTool(Tool):
         )
     
     def _list_jobs(self) -> str:
-        if not self._principal_id:
+        if not self._context.get().principal_id:
             return "Error: no principal identity context for reminder listing"
         jobs = [
             j for j in self._cron.list_jobs()
-            if (j.payload.tenant_id == self._tenant_id and j.payload.principal_id == self._principal_id)
+            if self._is_same_scope(j)
         ]
         if not jobs:
             return "No active reminders."
@@ -218,7 +244,7 @@ class ReminderTool(Tool):
     def _remove_job(self, job_id: str | None) -> str:
         if not job_id:
             return "Error: job_id is required for remove"
-        if not self._principal_id:
+        if not self._context.get().principal_id:
             return "Error: no principal identity context for reminder removal"
         target = next(
             (j for j in self._cron.list_jobs(include_disabled=True) if j.id == job_id),
@@ -226,11 +252,24 @@ class ReminderTool(Tool):
         )
         if target is None:
             return f"Reminder {job_id} not found"
-        if target.payload.tenant_id != self._tenant_id or target.payload.principal_id != self._principal_id:
+        if not self._is_same_scope(target):
             return f"Reminder {job_id} not found"
         if self._cron.remove_job(job_id):
             return f"Removed reminder {job_id}"
         return f"Reminder {job_id} not found"
+
+    def _is_same_scope(self, job: Any) -> bool:
+        """Strict reminder isolation: tenant + principal + conversation scope."""
+        context = self._context.get()
+        payload = job.payload
+        return (
+            (payload.tenant_id or "default") == (context.tenant_id or "default")
+            and (payload.principal_id or "") == (context.principal_id or "")
+            and (payload.channel or "") == (context.channel or "")
+            and (payload.to or "") == (context.chat_id or "")
+            and (payload.thread_id or "") == (context.thread_id or "")
+            and (payload.chat_type or "private") == (context.chat_type or "private")
+        )
 
 
 # Backward-compatible alias for existing imports.

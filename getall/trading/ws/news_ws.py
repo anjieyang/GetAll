@@ -21,7 +21,7 @@ from typing import Any, Callable, Awaitable
 from loguru import logger
 
 from getall.bus.events import OutboundMessage
-from getall.routing import load_last_route
+from getall.routing import load_all_routes
 from getall.trading.watch_scope import get_active_watch_coins, extract_coin
 from getall.config.schema import TradingConfig
 
@@ -345,25 +345,30 @@ class BweNewsWS:
 
     async def _push_to_user(self, content: str) -> None:
         """
-        Send breaking news notification to user.
+        Send breaking news notification to every registered principal route.
+
+        Falls back to internal ws channel when no routes exist.
 
         Args:
             content: Formatted message string.
         """
         try:
-            route = load_last_route()
-            if route:
-                msg = OutboundMessage(
-                    channel=route.channel,
-                    chat_id=route.chat_id,
-                    content=content,
-                )
-            else:
-                msg = OutboundMessage(
-                    channel="__ws_push__",
-                    chat_id="__active__",
-                    content=content,
-                )
+            routes = load_all_routes()
+            if routes:
+                for _pid, route in routes.items():
+                    msg = OutboundMessage(
+                        channel=route.channel,
+                        chat_id=route.chat_id,
+                        content=content,
+                    )
+                    await self.send_callback(msg)
+                return
+
+            msg = OutboundMessage(
+                channel="__ws_push__",
+                chat_id="__active__",
+                content=content,
+            )
             await self.send_callback(msg)
         except Exception as e:
             logger.error(f"[ws:breaking-news] failed to push: {e}")

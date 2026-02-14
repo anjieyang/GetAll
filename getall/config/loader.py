@@ -84,6 +84,13 @@ def _apply_env_overrides(config: Config) -> None:
     # --- LLM model ---
     if val := os.environ.get("GETALL_MODEL"):
         config.agents.defaults.model = val
+    if val := os.environ.get("GETALL_MAX_CONCURRENT_WORKERS"):
+        try:
+            config.agents.defaults.max_concurrent_workers = max(1, int(val))
+        except ValueError:
+            pass
+    if val := os.environ.get("GETALL_REASONING_EFFORT"):
+        config.agents.defaults.reasoning_effort = val
 
     # --- Provider API keys ---
     for env_key, provider_name in _ENV_PROVIDER_MAP.items():
@@ -138,8 +145,19 @@ def _apply_env_overrides(config: Config) -> None:
         config.channels.dingtalk.client_secret = val
 
     # --- Web search ---
+    if val := os.environ.get("GETALL_WEB_SEARCH_PROVIDER"):
+        config.tools.web.search.provider = val
     if val := os.environ.get("GETALL_BRAVE_API_KEY"):
         config.tools.web.search.api_key = val
+    if val := os.environ.get("GETALL_WEB_SEARCH_OPENAI_API_KEY"):
+        config.tools.web.search.openai_api_key = val
+    if val := os.environ.get("GETALL_WEB_SEARCH_OPENAI_MODEL"):
+        config.tools.web.search.openai_model = val
+    if val := os.environ.get("GETALL_WEB_SEARCH_MAX_RESULTS"):
+        try:
+            config.tools.web.search.max_results = max(1, min(10, int(val)))
+        except ValueError:
+            pass
 
     # --- Gateway ---
     if val := os.environ.get("GETALL_GATEWAY_PORT"):

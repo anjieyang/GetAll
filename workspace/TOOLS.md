@@ -45,12 +45,13 @@ exec(command: str, working_dir: str = None) -> str
 ## Web Access
 
 ### web_search
-Search the web using Brave Search API.
+Search the web using Brave, OpenAI web search, or DuckDuckGo.
 ```
 web_search(query: str, count: int = 5) -> str
 ```
 
-Returns search results with titles, URLs, and snippets. Requires `tools.web.search.apiKey` in config.
+Returns search results with titles, URLs, and snippets.
+If Brave/OpenAI keys are missing, it can fall back to DuckDuckGo (no key).
 
 ### web_fetch
 Fetch and extract main content from a URL.
@@ -71,6 +72,47 @@ Send a message to the user (used internally).
 message(content: str, channel: str = None, chat_id: str = None) -> str
 ```
 
+## Voice (Built-in TTS/STT)
+
+You have **native** voice capability — no third-party API keys or skills needed.
+
+### How it works
+- **STT (Speech-to-Text)**: When a user sends a voice message, it is automatically transcribed and delivered to you as text. You don't need to do anything special.
+- **TTS (Text-to-Speech)**: When voice mode is active, your text reply is automatically converted to an audio message and sent back to the user.
+- **Voice mode** is enabled automatically when the user sends a voice message, or when they say "用语音"/"发语音". It is disabled when the user says "用文字"/"别用语音".
+
+### Choosing a voice
+When voice mode is active, pick a voice that fits the mood by adding a tag anywhere in your reply:
+```
+[[voice:coral]]           ← just pick a voice
+[[voice:onyx instructions=用低沉严肃的语气]]  ← voice + style instructions
+```
+The tag is stripped before audio synthesis — the user won't see it.
+
+**Available voices:**
+| Voice | Characteristics |
+|---|---|
+| `alloy` | Neutral, balanced, versatile |
+| `ash` | Warm, conversational male |
+| `ballad` | Expressive, melodic |
+| `coral` | Warm, engaging female (default) |
+| `echo` | Smooth, deep male |
+| `fable` | Expressive, British accent |
+| `nova` | Warm, upbeat female |
+| `onyx` | Deep, authoritative male |
+| `sage` | Calm, composed |
+| `shimmer` | Bright, optimistic female |
+| `verse` | Versatile, expressive |
+| `marin` | Natural high-quality female ★ |
+| `cedar` | Natural high-quality male ★ |
+
+### Voice mode guidelines
+- Keep replies concise and conversational (≤300 chars ideal)
+- Avoid code blocks, tables, and complex formatting — these don't work as speech
+- If the answer needs code or long text, just reply in text — the system will automatically skip TTS for code-heavy or long responses
+- Use `instructions` to control emotion, speed, accent, whispering, etc.
+- **Do NOT** look for or try to use external TTS skills/APIs — your voice capability is built-in
+
 ## Background Tasks
 
 ### spawn
@@ -80,6 +122,34 @@ spawn(task: str, label: str = None) -> str
 ```
 
 Use for complex or time-consuming tasks that can run independently. The subagent will complete the task and report back when done.
+
+## Shared Workbench
+
+### workbench
+Create/run reusable scripts and shared skills, discover capabilities, and install skills from URLs.
+```
+workbench(
+  action: str,
+  script_name: str = "",
+  skill_name: str = "",
+  source_url: str = "",
+  content: str = "",
+  request: str = "",
+  risk_level: str = "readonly",
+  confirmed: bool = false
+) -> str
+```
+
+Common actions:
+- `list_scripts`, `create_script`, `run_script`
+- `list_skills`, `create_skill`
+- `discover_capabilities` (natural-language discovery, e.g. from ClawHub/MCP/GitHub)
+- `install_skill_from_url` (install into shared workspace)
+- `list_capabilities` (shared registry view)
+
+Security note:
+- For `install_skill_from_url`, set `risk_level="privileged"` only when needed.
+- Privileged installs require explicit confirmation via `confirmed=true`.
 
 ## Scheduled Reminders (Cron)
 
@@ -139,6 +209,22 @@ write_file(
     content="# Heartbeat Tasks\n\n- [ ] Task 1\n- [ ] Task 2\n"
 )
 ```
+
+## Backtesting
+
+### backtest
+Run historical backtests using the built-in VectorBT engine. Returns structured JSON metrics.
+```
+backtest(action: str, strategy_config: str, period: str = "6m", exchange: str = "binance", starting_balance: float = 100000) -> str
+```
+
+**Actions:**
+- `run` — Execute a backtest. Requires `strategy_config` (JSON string). Returns JSON with: `total_return_pct`, `win_rate_pct`, `profit_factor`, `sharpe_ratio`, `max_drawdown_pct`, `total_trades`, `chart_path`, etc.
+- `chart` — Generate equity chart from previous metrics JSON.
+
+**CRITICAL: This is the ONLY way to backtest.** Never install or use external backtesting frameworks (jesse, freqtrade, backtrader, nautilus_trader, backtesting.py, etc.). All backtesting goes through this tool.
+
+See the `backtest-runner` skill for workflow guidance on building strategy configs.
 
 ---
 

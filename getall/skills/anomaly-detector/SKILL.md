@@ -1,6 +1,6 @@
 ---
 name: anomaly-detector
-description: "Market anomaly detection. Monitor OI spikes, volume surges, funding rate extremes, liquidation cascades, whale transfers, and CVD divergences for watched coins."
+description: "Market anomaly detection via batch scanning. Monitor OI spikes, volume surges, funding rate extremes, liquidation cascades, whale transfers, and CVD divergences for watched coins. Use when user says 'scan for anomalies', '有什么异常', 'anything unusual', or 'check the market'. For deep whale analysis, defer to whale-watcher skill."
 metadata: '{"getall":{"always":false}}'
 ---
 
@@ -12,6 +12,10 @@ Detect unusual market activity across multiple dimensions for user's watched coi
 
 - **Automatic**: `cron:anomaly-scan` runs every 15 minutes — this skill defines what to check and thresholds
 - **On-demand**: User says "scan for anomalies", "anything unusual happening?", "check the market"
+
+## Relationship with whale-watcher
+
+This skill scans whale transfers as one of many dimensions in `batch_scan`. For **detailed whale analysis** (transfer pattern interpretation, exchange flow trends, large orderbook walls), defer to the `whale-watcher` skill. Use anomaly-detector for broad surveillance; use whale-watcher for deep dives.
 
 ## Monitoring Scope
 

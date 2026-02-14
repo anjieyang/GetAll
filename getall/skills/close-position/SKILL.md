@@ -1,6 +1,6 @@
 ---
 name: close-position
-description: "Smart position closing with analysis. Shows all positions, analyzes P&L, and helps decide what to close."
+description: "Smart position closing with analysis. Shows all positions, analyzes P&L, and helps decide what to close. Use when user says '平仓', '平掉', '关仓', '止盈', '止损', '减仓', '全平', 'close position', or wants to exit a trade."
 metadata: '{"getall":{"always":false,"emoji":"🚪","triggers":["平仓","close","平掉","关仓","了结","止盈","止损","减仓","全平"]}}'
 ---
 

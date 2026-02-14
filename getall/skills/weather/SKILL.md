@@ -1,6 +1,6 @@
 ---
 name: weather
-description: Get current weather and forecasts (no API key required).
+description: "Get current weather and forecasts for any location (no API key required). Use when user asks about weather, 天气, temperature, forecast, or '今天天气怎么样'."
 homepage: https://wttr.in/:help
 metadata: {"getall":{"emoji":"🌤️","requires":{"bins":["curl"]}}}
 ---

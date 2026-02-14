@@ -1,5 +1,6 @@
 """Spawn tool for creating background subagents."""
 
+from contextvars import ContextVar
 from typing import Any, TYPE_CHECKING
 
 from getall.agent.tools.base import Tool
@@ -18,13 +19,19 @@ class SpawnTool(Tool):
     
     def __init__(self, manager: "SubagentManager"):
         self._manager = manager
-        self._origin_channel = "cli"
-        self._origin_chat_id = "direct"
+        self._origin_channel_ctx: ContextVar[str] = ContextVar(
+            "spawn_tool_origin_channel",
+            default="cli",
+        )
+        self._origin_chat_id_ctx: ContextVar[str] = ContextVar(
+            "spawn_tool_origin_chat_id",
+            default="direct",
+        )
     
     def set_context(self, channel: str, chat_id: str) -> None:
         """Set the origin context for subagent announcements."""
-        self._origin_channel = channel
-        self._origin_chat_id = chat_id
+        self._origin_channel_ctx.set(channel)
+        self._origin_chat_id_ctx.set(chat_id)
     
     @property
     def name(self) -> str:
@@ -60,6 +67,6 @@ class SpawnTool(Tool):
         return await self._manager.spawn(
             task=task,
             label=label,
-            origin_channel=self._origin_channel,
-            origin_chat_id=self._origin_chat_id,
+            origin_channel=self._origin_channel_ctx.get(),
+            origin_chat_id=self._origin_chat_id_ctx.get(),
         )

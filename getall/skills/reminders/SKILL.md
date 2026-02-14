@@ -1,6 +1,6 @@
 ---
 name: reminders
-description: Schedule reminders and recurring tasks.
+description: "Schedule reminders and recurring tasks. Use when user says '提醒我', 'remind me', 'every X minutes', '定时', 'schedule', or wants to set up periodic reports and alerts."
 ---
 
 # Reminders

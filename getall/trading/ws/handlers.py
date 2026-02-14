@@ -16,7 +16,7 @@ from typing import Any, Callable, Awaitable
 from loguru import logger
 
 from getall.bus.events import InboundMessage, OutboundMessage
-from getall.routing import load_last_route
+from getall.routing import load_all_routes, load_last_route
 from getall.trading.watch_scope import extract_coin, upsert_watch_coins
 from getall.utils.atomic_io import get_atomic_writer
 
@@ -90,7 +90,8 @@ class WSEventHandlers:
         """
         Send a system message into the agent loop so it can proactively analyze and message the user.
 
-        Uses last-route routing (feishu/telegram/etc.) to deliver the agent's response.
+        Delivers to every registered principal route so each user gets their own
+        notification in the channel/chat where they last interacted.
         """
         if not self.inbound_callback:
             return
@@ -102,51 +103,54 @@ class WSEventHandlers:
             return
         self._agent_event_last_ts[key] = now_ts
 
-        route = load_last_route()
-        if route:
-            origin_channel = route.channel
-            origin_chat_id = route.chat_id
+        routes = load_all_routes()
+        targets: list[tuple[str, str]] = []
+
+        if routes:
+            for _pid, route in routes.items():
+                targets.append((route.channel, route.chat_id))
         elif self._debug_console_push:
-            # Debug mode: allow proactive analysis to show up in gateway console
-            # even before any real external channel is configured.
-            origin_channel = "__ws_push__"
-            origin_chat_id = "__active__"
-            logger.debug("[ws:account] no last-route, using __ws_push__ (debug_console_push)")
+            targets.append(("__ws_push__", "__active__"))
+            logger.debug("[ws:account] no routes, using __ws_push__ (debug_console_push)")
         else:
-            logger.debug("[ws:account] no last-route, skip agent event")
+            logger.debug("[ws:account] no routes, skip agent event")
             return
 
-        msg = InboundMessage(
-            channel="system",
-            sender_id=sender_id,
-            chat_id=f"{origin_channel}:{origin_chat_id}",
-            content=content,
-        )
-        try:
-            await self.inbound_callback(msg)
-        except Exception as e:
-            logger.debug(f"[ws:account] failed to emit agent event: {e}")
+        for origin_channel, origin_chat_id in targets:
+            msg = InboundMessage(
+                channel="system",
+                sender_id=sender_id,
+                chat_id=f"{origin_channel}:{origin_chat_id}",
+                content=content,
+            )
+            try:
+                await self.inbound_callback(msg)
+            except Exception as e:
+                logger.debug(f"[ws:account] failed to emit agent event to {origin_channel}:{origin_chat_id}: {e}")
 
     async def _notify(self, content: str) -> None:
         """
-        Send a notification to the user via send_callback.
+        Send a notification to every registered principal route.
 
-        Prefer last-route delivery when available, otherwise fallback to internal ws channel.
+        Falls back to internal ws channel when no routes exist.
         """
         try:
-            route = load_last_route()
-            if route:
-                msg = OutboundMessage(
-                    channel=route.channel,
-                    chat_id=route.chat_id,
-                    content=content,
-                )
-            else:
-                msg = OutboundMessage(
-                    channel="__ws_push__",
-                    chat_id="__active__",
-                    content=content,
-                )
+            routes = load_all_routes()
+            if routes:
+                for _pid, route in routes.items():
+                    msg = OutboundMessage(
+                        channel=route.channel,
+                        chat_id=route.chat_id,
+                        content=content,
+                    )
+                    await self.send_callback(msg)
+                return
+
+            msg = OutboundMessage(
+                channel="__ws_push__",
+                chat_id="__active__",
+                content=content,
+            )
             await self.send_callback(msg)
         except Exception as e:
             logger.error(f"Failed to push notification: {e}")

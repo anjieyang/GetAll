@@ -1,7 +1,7 @@
 ---
 name: memory
-description: Two-layer memory system with grep-based recall.
-always: true
+description: "Two-layer memory system: MEMORY.md for long-term facts (always in context), HISTORY.md for event log (grep-searchable). Use when storing user preferences, project context, or searching past events."
+metadata: '{"getall":{"always":true}}'
 ---
 
 # Memory

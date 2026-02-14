@@ -32,18 +32,32 @@ class SubagentManager:
         workspace: Path,
         bus: MessageBus,
         model: str | None = None,
+        max_tokens: int = 65536,
         brave_api_key: str | None = None,
+        web_search_provider: str = "brave",
+        web_search_api_key: str | None = None,
+        web_search_openai_api_key: str | None = None,
+        web_search_openai_model: str = "gpt-4o-mini",
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
+        reasoning_effort: str = "",
     ):
         from getall.config.schema import ExecToolConfig
         self.provider = provider
         self.workspace = workspace
         self.bus = bus
         self.model = model or provider.get_default_model()
+        self.max_tokens = max_tokens
         self.brave_api_key = brave_api_key
+        self.web_search_provider = web_search_provider
+        self.web_search_api_key = (
+            web_search_api_key if web_search_api_key is not None else brave_api_key
+        )
+        self.web_search_openai_api_key = web_search_openai_api_key
+        self.web_search_openai_model = web_search_openai_model
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
+        self.reasoning_effort = reasoning_effort
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
     
     async def spawn(
@@ -99,16 +113,34 @@ class SubagentManager:
             # Build subagent tools (no message tool, no spawn tool)
             tools = ToolRegistry()
             allowed_dir = self.workspace if self.restrict_to_workspace else None
+            protected_paths = {self.workspace / "SOUL.md"}
             tools.register(ReadFileTool(allowed_dir=allowed_dir))
-            tools.register(WriteFileTool(allowed_dir=allowed_dir))
-            tools.register(EditFileTool(allowed_dir=allowed_dir))
+            tools.register(
+                WriteFileTool(
+                    allowed_dir=allowed_dir,
+                    protected_paths=protected_paths,
+                )
+            )
+            tools.register(
+                EditFileTool(
+                    allowed_dir=allowed_dir,
+                    protected_paths=protected_paths,
+                )
+            )
             tools.register(ListDirTool(allowed_dir=allowed_dir))
             tools.register(ExecTool(
                 working_dir=str(self.workspace),
                 timeout=self.exec_config.timeout,
                 restrict_to_workspace=self.restrict_to_workspace,
             ))
-            tools.register(WebSearchTool(api_key=self.brave_api_key))
+            tools.register(
+                WebSearchTool(
+                    provider=self.web_search_provider,
+                    api_key=self.web_search_api_key,
+                    openai_api_key=self.web_search_openai_api_key,
+                    openai_model=self.web_search_openai_model,
+                )
+            )
             tools.register(WebFetchTool())
             
             # Build messages with subagent-specific prompt
@@ -130,6 +162,8 @@ class SubagentManager:
                     messages=messages,
                     tools=tools.get_definitions(),
                     model=self.model,
+                    max_tokens=self.max_tokens,
+                    reasoning_effort=self.reasoning_effort,
                 )
                 
                 if response.has_tool_calls:

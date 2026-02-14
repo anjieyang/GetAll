@@ -1,1352 +1,821 @@
-"""回测引擎: 封装 Nautilus Trader 的 BacktestEngine / TradingNode.
+"""VectorBT-native backtest engine.
 
-提供:
-  - run_backtest(): 历史回测 (BacktestEngine low-level API)
-  - start_paper() / stop_paper(): Paper Trading (TradingNode + testnet)
+Atomic capability: takes OHLCV DataFrame + strategy config dict →
+runs vectorbt.Portfolio.from_signals() → returns structured metrics dict.
+
+Design principles (per Anthropic skill guide):
+  - Tool = raw capability, returns structured facts (JSON-serialisable dict)
+  - No report formatting, no interpretation — that's the agent's job via skills
+  - Thin, composable, easy to test
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
-import importlib.util
-import sys
+import math
+import re
 import uuid
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
+import pandas_ta as ta
+import vectorbt as vbt
 from loguru import logger
 
-from getall.trading.backtest.data_loader import OHLCVLoader
-from getall.trading.backtest.strategies import StrategySpec, NAUTILUS_INDICATORS
-
-# Nautilus 按需导入
-_NT_AVAILABLE = False
-try:
-    from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
-    from nautilus_trader.backtest.models import FillModel
-    from nautilus_trader.config import LoggingConfig
-    from nautilus_trader.model import (
-        Bar,
-        BarType,
-        InstrumentId,
-        Quantity,
-        Venue,
-        Money,
-        Price,
-    )
-    from nautilus_trader.model.enums import AccountType, OmsType
-    from nautilus_trader.model.objects import Currency
-    from nautilus_trader.model.instruments import CryptoPerpetual
-    from nautilus_trader.model.identifiers import Symbol
-    from nautilus_trader.test_kit.providers import TestInstrumentProvider
-
-    _NT_AVAILABLE = True
-except ImportError:
-    logger.debug("nautilus_trader not installed — BacktestRunner limited to dry mode")
-
 
 # ═══════════════════════════════════════════════════════
-# 回测结果
+# Indicator computation
 # ═══════════════════════════════════════════════════════
 
+_INDICATOR_REGISTRY: dict[str, dict[str, Any]] = {
+    # Moving averages
+    "sma": {"fn": lambda df, p: ta.sma(df["close"], length=p.get("period", 20)), "defaults": {"period": 20}},
+    "ema": {"fn": lambda df, p: ta.ema(df["close"], length=p.get("period", 20)), "defaults": {"period": 20}},
+    "dema": {"fn": lambda df, p: ta.dema(df["close"], length=p.get("period", 20)), "defaults": {"period": 20}},
+    "hma": {"fn": lambda df, p: ta.hma(df["close"], length=p.get("period", 20)), "defaults": {"period": 20}},
+    "wma": {"fn": lambda df, p: ta.wma(df["close"], length=p.get("period", 20)), "defaults": {"period": 20}},
+    # Momentum
+    "rsi": {"fn": lambda df, p: ta.rsi(df["close"], length=p.get("period", 14)), "defaults": {"period": 14}},
+    "roc": {"fn": lambda df, p: ta.roc(df["close"], length=p.get("period", 10)), "defaults": {"period": 10}},
+    "cci": {"fn": lambda df, p: ta.cci(df["high"], df["low"], df["close"], length=p.get("period", 20)), "defaults": {"period": 20}},
+    # MACD — multi-output
+    "macd": {
+        "fn": lambda df, p: ta.macd(
+            df["close"],
+            fast=p.get("fast_period", 12),
+            slow=p.get("slow_period", 26),
+            signal=p.get("signal_period", 9),
+        ),
+        "defaults": {"fast_period": 12, "slow_period": 26, "signal_period": 9},
+        "multi": True,  # returns DataFrame with columns [MACD_*, MACDs_*, MACDh_*]
+    },
+    # Bollinger Bands — multi-output
+    "bollinger": {
+        "fn": lambda df, p: ta.bbands(df["close"], length=p.get("period", 20), std=p.get("std", 2.0)),
+        "defaults": {"period": 20, "std": 2.0},
+        "multi": True,
+    },
+    # Stochastics — multi-output
+    "stoch": {
+        "fn": lambda df, p: ta.stoch(df["high"], df["low"], df["close"], k=p.get("period_k", 14), d=p.get("period_d", 3)),
+        "defaults": {"period_k": 14, "period_d": 3},
+        "multi": True,
+    },
+    # Volatility
+    "atr": {"fn": lambda df, p: ta.atr(df["high"], df["low"], df["close"], length=p.get("period", 14)), "defaults": {"period": 14}},
+}
 
-@dataclass
-class BacktestResult:
-    """回测结果摘要."""
-    strategy_name: str = ""
-    symbols: list[str] = field(default_factory=list)
-    timeframe: str = ""
-    period_start: str = ""
-    period_end: str = ""
-    total_days: int = 0
+# Canonical field aliases for multi-output indicators
+_MULTI_FIELD_MAP: dict[str, dict[str, int]] = {
+    "macd": {"value": 0, "signal": 1, "histogram": 2},
+    "bollinger": {"lower": 0, "mid": 1, "upper": 2, "bandwidth": 3, "percent": 4},
+    "stoch": {"k": 0, "d": 1},
+}
 
-    # 绩效指标
-    total_trades: int = 0
-    win_rate: float = 0.0
-    profit_factor: float = 0.0
-    max_drawdown_pct: float = 0.0
-    sharpe_ratio: float = 0.0
-    total_pnl: float = 0.0
-    annualized_return_pct: float = 0.0
-    avg_win: float = 0.0
-    avg_loss: float = 0.0
-    best_trade: float = 0.0
-    worst_trade: float = 0.0
-    avg_hold_time: str = ""
-    expectancy: float = 0.0
 
-    # 原始数据 (可选, 用于详细分析)
-    positions_report: str = ""
-    orders_report: str = ""
-
-    # 权益曲线数据 (用于生成图表)
-    equity_curve: list[dict[str, Any]] = field(default_factory=list)  # [{"timestamp": ..., "equity": ..., "drawdown": ...}]
-
-    # 状态
-    success: bool = True
-    error: str = ""
-
-    def to_report(self) -> str:
-        """格式化为人类可读的报告."""
-        if not self.success:
-            return f"Backtest Failed: {self.error}"
-
-        return (
-            f"Backtest Results: {self.strategy_name}\n"
-            f"{'═' * 55}\n"
-            f"Period: {self.period_start} -> {self.period_end} ({self.total_days} days)\n"
-            f"Symbols: {', '.join(self.symbols)}\n"
-            f"Timeframe: {self.timeframe}\n"
-            f"\n"
-            f"Performance\n"
-            f"{'─' * 55}\n"
-            f"  Total Trades:      {self.total_trades}\n"
-            f"  Win Rate:          {self.win_rate:.1f}%\n"
-            f"  Profit Factor:     {self.profit_factor:.2f}\n"
-            f"  Max Drawdown:      {self.max_drawdown_pct:.2f}%\n"
-            f"  Sharpe Ratio:      {self.sharpe_ratio:.2f}\n"
-            f"  Total P&L:         {self.total_pnl:.2f}\n"
-            f"  Annualized Return: {self.annualized_return_pct:.2f}%\n"
-            f"  Expectancy:        {self.expectancy:.4f}/trade\n"
-            f"\n"
-            f"Trade Distribution\n"
-            f"{'─' * 55}\n"
-            f"  Best Trade:  +{self.best_trade:.2f}\n"
-            f"  Worst Trade: {self.worst_trade:.2f}\n"
-            f"  Avg Winner:  +{self.avg_win:.2f}\n"
-            f"  Avg Loser:   {self.avg_loss:.2f}\n"
-            f"  Avg Hold:    {self.avg_hold_time}\n"
-            f"\n"
-            f"Quality Assessment\n"
-            f"{'─' * 55}\n"
-            f"{self._quality_assessment()}\n"
-            f"{'═' * 55}"
-        )
-
-    def _quality_assessment(self) -> str:
-        """生成质量评估."""
-        lines: list[str] = []
-
-        if self.total_trades < 20:
-            lines.append("  [!] Low sample size (<20 trades) — results may not be statistically significant")
-        if self.win_rate > 80:
-            lines.append("  [!] Very high win rate (>80%) — potential overfitting risk")
-        if self.max_drawdown_pct > 20:
-            lines.append("  [!] High drawdown (>20%) — consider tighter stop-losses")
-
-        if self.win_rate > 55 and self.profit_factor > 1.5:
-            lines.append("  [+] Strategy looks promising (WR>55%, PF>1.5)")
-        elif self.win_rate < 40 or self.profit_factor < 1.0:
-            lines.append("  [-] Strategy needs improvement (low WR or PF<1)")
-        else:
-            lines.append("  [~] Moderate performance — consider parameter optimization")
-
-        if self.sharpe_ratio > 1.5:
-            lines.append("  [+] Good risk-adjusted return (Sharpe>1.5)")
-        elif self.sharpe_ratio < 0.5:
-            lines.append("  [-] Poor risk-adjusted return (Sharpe<0.5)")
-
-        return "\n".join(lines) if lines else "  No specific concerns."
-
-    def to_strategy_yaml(self) -> str:
-        """生成 STRATEGY.md 中的 backtest: YAML 区块."""
-        return (
-            f"backtest:\n"
-            f'  engine: "nautilus_trader"\n'
-            f'  period: "{self.period_start} ~ {self.period_end}"\n'
-            f"  win_rate: {self.win_rate:.1f}\n"
-            f"  profit_factor: {self.profit_factor:.2f}\n"
-            f'  max_drawdown: "{self.max_drawdown_pct:.2f}%"\n'
-            f"  sharpe_ratio: {self.sharpe_ratio:.2f}\n"
-            f"  total_trades: {self.total_trades}"
-        )
-
-    def generate_equity_chart(self, save_path: str | None = None) -> str | None:
-        """生成收益曲线图.
-
-        Args:
-            save_path: 图片保存路径. 如果为 None, 则自动生成临时文件路径.
-
-        Returns:
-            图片文件路径, 如果没有数据则返回 None.
-        """
-        if not self.equity_curve:
-            logger.warning("No equity curve data available for chart generation")
-            return None
-
+def compute_indicators(
+    df: pd.DataFrame,
+    indicator_configs: list[dict[str, Any]],
+) -> dict[str, pd.Series]:
+    """Compute all requested indicators and return a flat {key: Series} dict."""
+    result: dict[str, pd.Series] = {}
+    for cfg in indicator_configs:
+        name = cfg["name"].lower()
+        params = {**_INDICATOR_REGISTRY.get(name, {}).get("defaults", {}), **cfg.get("params", {})}
+        key = cfg.get("key", name)
+        reg = _INDICATOR_REGISTRY.get(name)
+        if reg is None:
+            logger.warning(f"Unknown indicator '{name}', skipping")
+            continue
         try:
-            import matplotlib
-            matplotlib.use('Agg')  # 无头模式
-            import matplotlib.pyplot as plt
-            import matplotlib.dates as mdates
-            from datetime import datetime as dt
-        except ImportError:
-            logger.error("matplotlib not installed. Run: pip install matplotlib")
-            return None
-
-        # 准备数据
-        timestamps = []
-        equities = []
-        drawdowns = []
-
-        for point in self.equity_curve:
-            ts = point.get("timestamp")
-            if isinstance(ts, str):
-                try:
-                    timestamps.append(dt.fromisoformat(ts.replace("Z", "+00:00")))
-                except ValueError:
-                    timestamps.append(dt.now())
-            else:
-                timestamps.append(ts)
-            equities.append(point.get("equity", 0))
-            drawdowns.append(point.get("drawdown", 0))
-
-        if not timestamps:
-            return None
-
-        # 创建图表
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), gridspec_kw={'height_ratios': [3, 1]})
-        fig.suptitle(f'Backtest Results: {self.strategy_name}', fontsize=14, fontweight='bold')
-
-        # 上图: 权益曲线
-        ax1.plot(timestamps, equities, 'b-', linewidth=1.5, label='Equity')
-        ax1.fill_between(timestamps, equities[0] if equities else 0, equities, alpha=0.3)
-        ax1.axhline(y=equities[0] if equities else 100000, color='gray', linestyle='--', alpha=0.5, label='Initial')
-        ax1.set_ylabel('Equity', fontsize=10)
-        ax1.set_title(f'Period: {self.period_start} → {self.period_end} | '
-                      f'Trades: {self.total_trades} | Win Rate: {self.win_rate:.1f}%', fontsize=10)
-        ax1.legend(loc='upper left')
-        ax1.grid(True, alpha=0.3)
-
-        # 格式化 x 轴日期
-        ax1.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
-        ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
-
-        # 下图: 回撤曲线
-        ax2.fill_between(timestamps, 0, drawdowns, color='red', alpha=0.5)
-        ax2.plot(timestamps, drawdowns, 'r-', linewidth=1)
-        ax2.set_ylabel('Drawdown %', fontsize=10)
-        ax2.set_xlabel('Date', fontsize=10)
-        ax2.set_ylim(min(drawdowns) * 1.1 if drawdowns and min(drawdowns) < 0 else -10, 0)
-        ax2.grid(True, alpha=0.3)
-        ax2.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
-        ax2.xaxis.set_major_locator(mdates.AutoDateLocator())
-
-        # 添加关键指标注释
-        stats_text = (
-            f"P&L: {self.total_pnl:+.2f}% | "
-            f"Max DD: {self.max_drawdown_pct:.2f}% | "
-            f"Sharpe: {self.sharpe_ratio:.2f} | "
-            f"PF: {self.profit_factor:.2f}"
-        )
-        fig.text(0.5, 0.02, stats_text, ha='center', fontsize=9, style='italic')
-
-        plt.tight_layout(rect=[0, 0.03, 1, 0.97])
-
-        # 保存图片
-        if save_path is None:
-            import tempfile
-            temp_dir = Path(tempfile.gettempdir()) / "getall_charts"
-            temp_dir.mkdir(parents=True, exist_ok=True)
-            save_path = str(temp_dir / f"backtest_{self.strategy_name}_{uuid.uuid4().hex[:8]}.png")
-
-        plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
-        plt.close(fig)
-
-        logger.info(f"Equity chart saved to: {save_path}")
-        return save_path
+            out = reg["fn"](df, params)
+        except Exception as e:
+            logger.warning(f"Error computing indicator {name}: {e}")
+            continue
+        if reg.get("multi") and isinstance(out, pd.DataFrame) and out is not None:
+            field_map = _MULTI_FIELD_MAP.get(name, {})
+            for field_name, col_idx in field_map.items():
+                if col_idx < len(out.columns):
+                    result[f"{key}_{field_name}"] = out.iloc[:, col_idx]
+            # Also store first column as plain key for simple references
+            result[key] = out.iloc[:, 0]
+        elif isinstance(out, pd.Series):
+            result[key] = out
+    # Always include OHLCV as referenceable series
+    for col in ("open", "high", "low", "close", "volume"):
+        if col in df.columns:
+            result[col] = df[col]
+    return result
 
 
 # ═══════════════════════════════════════════════════════
-# Paper Trading Session 管理
+# Condition evaluation → boolean signal arrays
 # ═══════════════════════════════════════════════════════
 
+def _resolve_value(
+    raw: float | int | str,
+    indicators: dict[str, pd.Series],
+) -> pd.Series | float:
+    """Resolve a condition threshold — either a literal number or an indicator reference."""
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    s = str(raw)
+    # "indicator.field" e.g. "macd.signal" → key "macd_signal"
+    if "." in s:
+        ref_key, ref_field = s.split(".", 1)
+        lookup = f"{ref_key}_{ref_field}"
+        if lookup in indicators:
+            return indicators[lookup]
+    # Direct key
+    if s in indicators:
+        return indicators[s]
+    # Try as number
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    return float("nan")
 
-@dataclass
-class PaperSession:
-    """Paper Trading 会话信息."""
-    session_id: str
-    strategy_name: str
-    symbols: list[str]
-    status: str = "running"       # running / stopped
-    started_at: str = ""
-    stopped_at: str = ""
-    config_json: str = ""
-    # TradingNode 实例 (运行时)
-    _node: Any = field(default=None, repr=False)
-    _task: Any = field(default=None, repr=False)
+
+def _eval_op(current: pd.Series, op: str, threshold: pd.Series | float) -> pd.Series:
+    """Apply a comparison operator and return a boolean Series."""
+    if op == "lt":
+        return current < threshold
+    if op == "gt":
+        return current > threshold
+    if op == "lte":
+        return current <= threshold
+    if op == "gte":
+        return current >= threshold
+    if op == "eq":
+        if isinstance(threshold, pd.Series):
+            return (current - threshold).abs() < 1e-8
+        return (current - threshold).abs() < 1e-8
+    if op == "cross_above":
+        prev = current.shift(1)
+        if isinstance(threshold, pd.Series):
+            return (prev <= threshold.shift(1)) & (current > threshold)
+        return (prev <= threshold) & (current > threshold)
+    if op == "cross_below":
+        prev = current.shift(1)
+        if isinstance(threshold, pd.Series):
+            return (prev >= threshold.shift(1)) & (current < threshold)
+        return (prev >= threshold) & (current > threshold)
+    logger.warning(f"Unknown operator '{op}', returning False")
+    return pd.Series(False, index=current.index)
 
 
-# ═══════════════════════════════════════════════════════
-# 回测引擎
-# ═══════════════════════════════════════════════════════
+def evaluate_conditions(
+    conditions: list[dict[str, Any]],
+    indicators: dict[str, pd.Series],
+    logic: str = "and",
+) -> pd.Series:
+    """Evaluate a list of conditions and combine with AND or OR logic.
 
-
-class BacktestRunner:
-    """封装 Nautilus Trader 的回测与 Paper Trading 能力.
-
-    使用方式:
-      runner = BacktestRunner(workspace_path)
-      result = await runner.run_backtest(ohlcv_data, strategy_spec)
-      session = await runner.start_paper(strategy_spec, api_key, api_secret)
-      result = await runner.stop_paper(session_id)
+    Each condition: {"indicator": str, "field": str, "operator": str, "value": ...}
     """
+    if not conditions:
+        return pd.Series(False, index=next(iter(indicators.values())).index)
 
-    def __init__(self, workspace_path: Path):
-        self.workspace = workspace_path
-        self._catalog_path = workspace_path / ".cache" / "backtest_catalog"
-        self._catalog_path.mkdir(parents=True, exist_ok=True)
-        self._paper_sessions: dict[str, PaperSession] = {}
+    signals: list[pd.Series] = []
+    for cond in conditions:
+        ind_key = cond["indicator"]
+        field = cond.get("field", "value")
+        # Resolve current value series
+        lookup = ind_key if field == "value" else f"{ind_key}_{field}"
+        current = indicators.get(lookup)
+        if current is None and field == "value":
+            current = indicators.get(f"{ind_key}_value")
+        if current is None:
+            current = indicators.get(ind_key)
+        if current is None:
+            logger.warning(f"Indicator '{lookup}' not found, condition skipped")
+            continue
 
-    # ─────────────── 历史回测 ───────────────
+        threshold = _resolve_value(cond["value"], indicators)
+        sig = _eval_op(current, cond["operator"], threshold)
+        signals.append(sig)
 
-    async def run_backtest(
-        self,
-        ohlcv_data: dict[str, pd.DataFrame],
-        strategy_spec: StrategySpec,
-        starting_balance: float = 100_000.0,
-    ) -> BacktestResult:
-        """运行历史回测.
+    if not signals:
+        return pd.Series(False, index=next(iter(indicators.values())).index)
 
-        Args:
-            ohlcv_data: {symbol: DataFrame} 格式的 OHLCV 数据.
-            strategy_spec: 策略配置.
-            starting_balance: 初始资金.
+    combined = signals[0]
+    for s in signals[1:]:
+        combined = (combined & s) if logic == "and" else (combined | s)
+    return combined.fillna(False)
 
-        Returns:
-            BacktestResult 回测结果.
-        """
-        if not _NT_AVAILABLE:
-            return await self._run_backtest_pandas(ohlcv_data, strategy_spec)
+
+# ═══════════════════════════════════════════════════════
+# Core backtest runner
+# ═══════════════════════════════════════════════════════
+
+def run_backtest(
+    ohlcv_data: dict[str, pd.DataFrame],
+    config: dict[str, Any],
+    starting_balance: float = 100_000.0,
+) -> dict[str, Any]:
+    """Run a VectorBT backtest and return structured metrics.
+
+    Args:
+        ohlcv_data: {symbol: DataFrame} with OHLCV columns + DatetimeIndex.
+        config: Strategy configuration dict with keys:
+            name, symbols, timeframe, indicators, entry_conditions,
+            exit_conditions, direction, stop_loss_pct, take_profit_pct,
+            trade_size_pct, leverage.
+        starting_balance: Initial cash.
+
+    Returns:
+        JSON-serialisable dict with metrics, equity curve, and trade list.
+    """
+    direction = config.get("direction", "long")
+    sl_pct = config.get("stop_loss_pct")
+    tp_pct = config.get("take_profit_pct")
+    size_pct = config.get("trade_size_pct", 100.0) / 100.0
+    fees = config.get("fees", 0.0006)
+
+    all_results: list[dict[str, Any]] = []
+
+    for symbol, df in ohlcv_data.items():
+        if df.empty:
+            continue
+
+        # 1. Compute indicators
+        indicators = compute_indicators(df, config.get("indicators", []))
+
+        # 2. Evaluate entry / exit signals
+        entry_signals = evaluate_conditions(config.get("entry_conditions", []), indicators, logic="and")
+        exit_signals = evaluate_conditions(config.get("exit_conditions", []), indicators, logic="or")
+
+        # 3. Build VectorBT portfolio
+        close = df["close"]
+        pf_kwargs: dict[str, Any] = {
+            "close": close,
+            "init_cash": starting_balance,
+            "size": size_pct,
+            "size_type": "percent",
+            "fees": fees,
+        }
+        if sl_pct is not None and sl_pct > 0:
+            pf_kwargs["sl_stop"] = sl_pct / 100.0
+        if tp_pct is not None and tp_pct > 0:
+            pf_kwargs["tp_stop"] = tp_pct / 100.0
+
+        if direction == "short":
+            pf_kwargs["short_entries"] = entry_signals
+            pf_kwargs["short_exits"] = exit_signals
+        elif direction == "both":
+            # For "both": use entry_conditions with direction field filtering
+            long_entry = _filter_directional(config.get("entry_conditions", []), "long", indicators)
+            long_exit = _filter_directional(config.get("exit_conditions", []), "long", indicators, logic="or")
+            short_entry = _filter_directional(config.get("entry_conditions", []), "short", indicators)
+            short_exit = _filter_directional(config.get("exit_conditions", []), "short", indicators, logic="or")
+            pf_kwargs["entries"] = long_entry
+            pf_kwargs["exits"] = long_exit
+            pf_kwargs["short_entries"] = short_entry
+            pf_kwargs["short_exits"] = short_exit
+        else:
+            pf_kwargs["entries"] = entry_signals
+            pf_kwargs["exits"] = exit_signals
 
         try:
-            return await asyncio.to_thread(
-                self._run_backtest_nautilus,
-                ohlcv_data,
-                strategy_spec,
-                starting_balance,
-            )
+            pf = vbt.Portfolio.from_signals(**pf_kwargs)
         except Exception as e:
-            logger.error(f"Nautilus backtest failed: {e}, falling back to pandas engine")
-            return await self._run_backtest_pandas(ohlcv_data, strategy_spec)
+            logger.error(f"VectorBT portfolio creation failed for {symbol}: {e}")
+            all_results.append({"symbol": symbol, "error": str(e)})
+            continue
 
-    def _run_backtest_nautilus(
-        self,
-        ohlcv_data: dict[str, pd.DataFrame],
-        strategy_spec: StrategySpec,
-        starting_balance: float,
-    ) -> BacktestResult:
-        """使用 Nautilus Trader BacktestEngine 执行回测 (同步, 在线程中运行)."""
-        from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
-        from nautilus_trader.model import (
-            BarType, InstrumentId, Venue, Money, Currency,
-        )
-        from nautilus_trader.model.enums import AccountType, OmsType
-        from nautilus_trader.config import LoggingConfig
-        from nautilus_trader.test_kit.providers import TestInstrumentProvider
-        from nautilus_trader.trading.strategy import StrategyConfig
-        from nautilus_trader.backtest.models import FillModel
+        # 4. Extract structured metrics
+        metrics = _extract_metrics(pf, symbol, df, starting_balance)
+        all_results.append(metrics)
 
-        from getall.trading.backtest.strategies import (
-            TemplateStrategy,
-            TemplateStrategyConfig,
-        )
+    # Merge multi-symbol or return single
+    if len(all_results) == 1:
+        result = all_results[0]
+    else:
+        result = _merge_results(all_results)
 
-        result = BacktestResult(
-            strategy_name=strategy_spec.name,
-            symbols=strategy_spec.symbols,
-            timeframe=strategy_spec.timeframe,
-        )
+    result["strategy_name"] = config.get("name", "unnamed")
+    result["timeframe"] = config.get("timeframe", "")
+    result["direction"] = direction
+    result["config"] = config
+    return result
 
-        # 1. 配置引擎
-        engine = BacktestEngine(
-            config=BacktestEngineConfig(
-                logging=LoggingConfig(log_level="ERROR"),  # Reduce verbosity
-            )
-        )
 
-        # 2. 添加模拟交易所 (使用 BINANCE 以匹配 TestInstrumentProvider 的 instruments)
-        venue = Venue("BINANCE")
-        engine.add_venue(
-            venue=venue,
-            oms_type=OmsType.NETTING,
-            account_type=AccountType.MARGIN,
-            base_currency=Currency.from_str("USDT"),
-            starting_balances=[Money(starting_balance, Currency.from_str("USDT"))],
-            fill_model=FillModel(),  # Use default fill model
-        )
+def _filter_directional(
+    conditions: list[dict[str, Any]],
+    target_dir: str,
+    indicators: dict[str, pd.Series],
+    logic: str = "and",
+) -> pd.Series:
+    """Filter conditions by direction tag and evaluate."""
+    filtered = []
+    for c in conditions:
+        d = str(c.get("direction", "")).lower()
+        if d and d != target_dir:
+            continue
+        filtered.append(c)
+    return evaluate_conditions(filtered, indicators, logic=logic)
 
-        # 3. 对每个 symbol 加载数据
-        instrument = None
-        for symbol, df in ohlcv_data.items():
-            if df.empty:
-                continue
 
-            # 动态计算价格精度（根据实际数据）
-            min_price = df[['open', 'high', 'low', 'close']].min().min()
-            if min_price > 0:
-                # 计算需要多少小数位才能精确表示价格
-                import math
-                price_precision = max(0, -int(math.floor(math.log10(min_price))) + 4)
-                price_precision = min(price_precision, 10)  # Cap at 10 decimals
-            else:
-                price_precision = 8  # Default for crypto
+def _extract_metrics(
+    pf: Any,
+    symbol: str,
+    df: pd.DataFrame,
+    starting_balance: float,
+) -> dict[str, Any]:
+    """Extract comprehensive structured metrics from a VectorBT Portfolio."""
+    trades = pf.trades
+    equity = pf.value()
+    total_trades = int(trades.count())
 
-            logger.debug(f"Auto-detected price precision for {symbol}: {price_precision} (min_price={min_price})")
+    # Period info
+    period_start = str(df.index[0])[:10] if len(df) > 0 else ""
+    period_end = str(df.index[-1])[:10] if len(df) > 0 else ""
+    total_days = max((df.index[-1] - df.index[0]).days, 1) if len(df) > 1 else 0
+    years = max(total_days / 365.0, 1 / 365.0)
+    ending_bal = round(float(equity.iloc[-1]), 2) if len(equity) > 0 else starting_balance
+    total_return = float(pf.total_return())
 
-            # 创建自定义 instrument 匹配价格精度
-            from decimal import Decimal
+    # Annualized return
+    ann_return = 0.0
+    if starting_balance > 0 and ending_bal > 0 and years > 0:
+        ann_return = ((ending_bal / starting_balance) ** (1 / years) - 1) * 100
 
-            instrument_id = InstrumentId(
-                symbol=Symbol("GENERIC"),
-                venue=Venue("BINANCE")
-            )
+    # Max drawdown duration
+    dd_duration_days = 0.0
+    if len(equity) > 1:
+        peaks = equity.cummax()
+        in_dd = equity < peaks
+        groups = (~in_dd).cumsum()
+        if in_dd.any():
+            dd_groups = in_dd.groupby(groups)
+            for _, grp in dd_groups:
+                if grp.any():
+                    dd_len = (grp.index[-1] - grp.index[0]).total_seconds() / 86400
+                    dd_duration_days = max(dd_duration_days, dd_len)
 
-            # 提取基础货币和报价货币
-            parts = symbol.split("/")
-            base_ccy = parts[0] if len(parts) > 0 else "BTC"
-            quote_ccy = parts[1].split(":")[0] if len(parts) > 1 else "USDT"
+    metrics: dict[str, Any] = {
+        "symbol": symbol,
+        "period_start": period_start,
+        "period_end": period_end,
+        "total_days": total_days,
+        # ── Portfolio performance ──
+        "starting_balance": starting_balance,
+        "ending_balance": ending_bal,
+        "net_profit": round(ending_bal - starting_balance, 2),
+        "total_return_pct": round(total_return * 100, 4),
+        "annualized_return_pct": round(ann_return, 2),
+        # ── Risk metrics ──
+        "max_drawdown_pct": round(abs(float(pf.drawdowns.max_drawdown())) * 100, 2),
+        "max_drawdown_duration_days": round(dd_duration_days, 1),
+        "sharpe_ratio": _safe_float(pf.sharpe_ratio()),
+        "sortino_ratio": _safe_float(pf.sortino_ratio()),
+        "calmar_ratio": round(ann_return / max(abs(float(pf.drawdowns.max_drawdown())) * 100, 0.01), 2),
+        # ── Trade quality ──
+        "total_trades": total_trades,
+        "win_rate_pct": round(float(trades.win_rate()) * 100, 2) if total_trades > 0 else 0.0,
+        "profit_factor": _safe_float(trades.profit_factor()) if total_trades > 0 else 0.0,
+        "expectancy": round(float(trades.expectancy()), 4) if total_trades > 0 else 0.0,
+    }
 
-            # CryptoPerpetual 用于永续合约（不需要过期时间）
-            instrument = CryptoPerpetual(
-                instrument_id=instrument_id,
-                raw_symbol=Symbol(symbol.replace("/", "").replace(":", "")),
-                base_currency=Currency.from_str(base_ccy),
-                quote_currency=Currency.from_str(quote_ccy),
-                settlement_currency=Currency.from_str(quote_ccy),
-                is_inverse=False,
-                price_precision=price_precision,
-                size_precision=3,
-                price_increment=Price(Decimal(f"1e-{price_precision}"), price_precision),
-                size_increment=Quantity(Decimal("0.001"), 3),
-                max_quantity=Quantity(Decimal("1000000"), 3),
-                min_quantity=Quantity(Decimal("0.001"), 3),
-                max_price=Price(Decimal("1000000"), price_precision),
-                min_price=Price(Decimal(f"1e-{price_precision}"), price_precision),
-                margin_init=Decimal("1.00"),
-                margin_maint=Decimal("0.35"),
-                maker_fee=Decimal("0.0002"),
-                taker_fee=Decimal("0.0004"),
-                ts_event=0,
-                ts_init=0,
-            )
+    # Trade-level detail
+    if total_trades > 0:
+        records = trades.records_readable
+        pnl_col = records["PnL"] if "PnL" in records.columns else pd.Series(dtype=float)
+        win_count = int(trades.winning.count())
+        loss_count = int(trades.losing.count())
+        avg_win = round(float(trades.winning.pnl.mean()), 2) if win_count > 0 else 0.0
+        avg_loss = round(float(trades.losing.pnl.mean()), 2) if loss_count > 0 else 0.0
+        payoff_ratio = round(abs(avg_win / avg_loss), 2) if avg_loss != 0 else 0.0
 
-            engine.add_instrument(instrument)
+        metrics["avg_win"] = avg_win
+        metrics["avg_loss"] = avg_loss
+        metrics["payoff_ratio"] = payoff_ratio
+        metrics["best_trade"] = round(float(pnl_col.max()), 2) if len(pnl_col) > 0 else 0.0
+        metrics["worst_trade"] = round(float(pnl_col.min()), 2) if len(pnl_col) > 0 else 0.0
 
-            # 转换 bar 数据
-            bar_type = BarType.from_str(f"{instrument.id}-1-MINUTE-LAST-EXTERNAL")
-
-            # 记录时间范围
-            if not df.empty:
-                result.period_start = str(df.index[0])[:10]
-                result.period_end = str(df.index[-1])[:10]
-                delta = df.index[-1] - df.index[0]
-                result.total_days = max(delta.days, 1)
-
-                # 添加 bar 数据到引擎
-                from nautilus_trader.core.datetime import dt_to_unix_nanos
-
-                bars = []
-                # Use dynamically calculated price precision instead of instrument precision
-                # Size precision stays at 3 for crypto perps
-                size_precision = 3
-
-                for ts, row in df.iterrows():
-                    # Round prices and volume to match precision
-                    bar = Bar(
-                        bar_type=bar_type,
-                        open=Price(round(float(row["open"]), price_precision), price_precision),
-                        high=Price(round(float(row["high"]), price_precision), price_precision),
-                        low=Price(round(float(row["low"]), price_precision), price_precision),
-                        close=Price(round(float(row["close"]), price_precision), price_precision),
-                        volume=Quantity(round(float(row["volume"]), size_precision), size_precision),
-                        ts_event=dt_to_unix_nanos(ts),
-                        ts_init=dt_to_unix_nanos(ts),
-                    )
-                    bars.append(bar)
-
-                engine.add_data(bars)
-                logger.info(f"Added {len(bars)} bars to engine for {symbol}")
-
-        if instrument is None:
-            result.success = False
-            result.error = "No valid data provided"
-            return result
-
-        # 4. 创建策略
-        # For backtesting with ETH-USDT perpetual:
-        # - Min size: 0.001 ETH
-        # - Size precision: 3 decimals
-        # - Use a reasonable fixed size for testing
-        strategy = TemplateStrategy(
-            config=TemplateStrategyConfig(
-                instrument_id=instrument.id,
-                strategy_spec_json=json.dumps(strategy_spec.to_json()),
-                trade_size=1_000,  # 1000 = 1.000 ETH (precision 3)
-            )
-        )
-        engine.add_strategy(strategy)
-
-        # 5. 运行回测
-        engine.run()
-
-        # 6. 提取结果
-        try:
-            positions = engine.trader.generate_positions_report()
-            orders = engine.trader.generate_order_fills_report()
-
-            if len(positions) > 0:
-                positions["pnl_numeric"] = positions["realized_pnl"].apply(
-                    lambda x: float(str(x).replace(" USDT", "").replace(",", ""))
-                    if isinstance(x, str) else float(x)
-                )
-                winners = positions[positions["pnl_numeric"] > 0]
-                losers = positions[positions["pnl_numeric"] < 0]
-
-                result.total_trades = len(positions)
-                result.win_rate = len(winners) / len(positions) * 100 if len(positions) > 0 else 0
-                result.total_pnl = positions["pnl_numeric"].sum()
-                result.best_trade = positions["pnl_numeric"].max()
-                result.worst_trade = positions["pnl_numeric"].min()
-
-                if len(winners) > 0:
-                    result.avg_win = winners["pnl_numeric"].mean()
-                if len(losers) > 0:
-                    result.avg_loss = losers["pnl_numeric"].mean()
-
-                gross_profit = winners["pnl_numeric"].sum() if len(winners) > 0 else 0
-                gross_loss = abs(losers["pnl_numeric"].sum()) if len(losers) > 0 else 0
-                result.profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
-
-                # Expectancy
-                if result.total_trades > 0:
-                    result.expectancy = result.total_pnl / result.total_trades
-
-                # Annualized return
-                if result.total_days > 0:
-                    result.annualized_return_pct = (result.total_pnl / starting_balance) * (365 / result.total_days) * 100
-
-                # Sharpe (简化: 用每笔交易收益)
-                if len(positions) > 1:
-                    returns = positions["pnl_numeric"] / starting_balance
-                    if returns.std() > 0:
-                        result.sharpe_ratio = (returns.mean() / returns.std()) * (252 ** 0.5)
-
-                result.positions_report = positions.to_string()
-                result.orders_report = orders.to_string() if len(orders) > 0 else ""
-
-                # 构建 equity_curve（类似 pandas 路径）
-                equity_curve = self._build_equity_curve_from_positions(
-                    positions=positions,
-                    starting_balance=starting_balance,
-                    period_start=result.period_start,
-                )
-                result.equity_curve = equity_curve
-
-                # 更新最大回撤
-                if equity_curve:
-                    result.max_drawdown_pct = abs(min(p["drawdown"] for p in equity_curve))
-
-        except Exception as e:
-            logger.warning(f"Error extracting results: {e}")
-
-        engine.dispose()
-        return result
-
-    def _build_equity_curve_from_positions(
-        self,
-        positions: pd.DataFrame,
-        starting_balance: float,
-        period_start: str,
-    ) -> list[dict[str, Any]]:
-        """从 Nautilus positions 构建 equity_curve.
-
-        Args:
-            positions: Nautilus positions report DataFrame (must have 'pnl_numeric' and 'ts_closed' columns)
-            starting_balance: 初始资金
-            period_start: 回测起始日期
-
-        Returns:
-            equity_curve 数据点列表
-        """
-        if len(positions) == 0:
-            return []
-
-        # 初始化
-        equity = starting_balance
-        peak_equity = starting_balance
-        equity_points = [{"timestamp": period_start, "equity": equity, "drawdown": 0.0}]
-
-        # 按时间排序 positions
-        if "ts_closed" in positions.columns:
-            positions = positions.sort_values("ts_closed")
-        elif "ts_opened" in positions.columns:
-            positions = positions.sort_values("ts_opened")
-
-        # 遍历每个交易
-        for _, pos in positions.iterrows():
-            # 更新权益
-            pnl = pos["pnl_numeric"]
-            equity += pnl
-
-            # 计算回撤
-            if equity > peak_equity:
-                peak_equity = equity
-            drawdown = ((equity - peak_equity) / peak_equity * 100) if peak_equity > 0 else 0
-
-            # 添加数据点
-            timestamp = pos.get("ts_closed") or pos.get("ts_opened")
-            if timestamp:
-                equity_points.append({
-                    "timestamp": str(timestamp),
-                    "equity": equity,
-                    "drawdown": drawdown,
-                })
-
-        return equity_points
-
-    async def _run_backtest_pandas(
-        self,
-        ohlcv_data: dict[str, pd.DataFrame],
-        strategy_spec: StrategySpec,
-    ) -> BacktestResult:
-        """纯 pandas 回测引擎 (Nautilus 不可用时的 fallback).
-
-        使用 pandas-ta 计算指标, 逐行遍历模拟交易.
-        """
-        import pandas_ta as ta
-
-        result = BacktestResult(
-            strategy_name=strategy_spec.name,
-            symbols=strategy_spec.symbols,
-            timeframe=strategy_spec.timeframe,
-        )
-
-        all_trades: list[dict[str, Any]] = []
-
-        for symbol, df in ohlcv_data.items():
-            if df.empty:
-                continue
-
-            result.period_start = str(df.index[0])[:10]
-            result.period_end = str(df.index[-1])[:10]
-            delta = df.index[-1] - df.index[0]
-            result.total_days = max(delta.days, 1)
-
-            # 计算指标
-            indicator_values: dict[str, pd.Series] = {}
-            for ind_cfg in strategy_spec.indicators:
-                name = ind_cfg["name"]
-                params = ind_cfg.get("params", {})
-                key = ind_cfg.get("key", name)
-
-                try:
-                    if name == "rsi":
-                        indicator_values[key] = ta.rsi(df["close"], length=params.get("period", 14))
-                    elif name == "sma":
-                        indicator_values[key] = ta.sma(df["close"], length=params.get("period", 20))
-                    elif name == "ema":
-                        indicator_values[key] = ta.ema(df["close"], length=params.get("period", 20))
-                    elif name == "macd":
-                        macd_df = ta.macd(
-                            df["close"],
-                            fast=params.get("fast_period", 12),
-                            slow=params.get("slow_period", 26),
-                            signal=params.get("signal_period", 9),
-                        )
-                        if macd_df is not None:
-                            indicator_values[f"{key}_value"] = macd_df.iloc[:, 0]
-                            indicator_values[f"{key}_signal"] = macd_df.iloc[:, 1]
-                            indicator_values[f"{key}_histogram"] = macd_df.iloc[:, 2]
-                    elif name == "bollinger":
-                        bb = ta.bbands(df["close"], length=params.get("period", 20), std=params.get("std", 2.0))
-                        if bb is not None:
-                            indicator_values[f"{key}_upper"] = bb.iloc[:, 0]
-                            indicator_values[f"{key}_mid"] = bb.iloc[:, 1]
-                            indicator_values[f"{key}_lower"] = bb.iloc[:, 2]
-                    elif name == "atr":
-                        indicator_values[key] = ta.atr(df["high"], df["low"], df["close"], length=params.get("period", 14))
-                    elif name == "cci":
-                        indicator_values[key] = ta.cci(df["high"], df["low"], df["close"], length=params.get("period", 20))
-                    elif name == "stoch":
-                        stoch_df = ta.stoch(df["high"], df["low"], df["close"],
-                                            k=params.get("period_k", 14), d=params.get("period_d", 3))
-                        if stoch_df is not None:
-                            indicator_values[f"{key}_k"] = stoch_df.iloc[:, 0]
-                            indicator_values[f"{key}_d"] = stoch_df.iloc[:, 1]
-                    elif name == "roc":
-                        indicator_values[key] = ta.roc(df["close"], length=params.get("period", 10))
-                    else:
-                        logger.warning(f"Pandas fallback: indicator {name} not supported, skipping")
-                except Exception as e:
-                    logger.warning(f"Error computing indicator {name}: {e}")
-
-            # 逐行遍历模拟交易
-            position_side: str | None = None  # "long" | "short"
-            entry_price = 0.0
-            entry_idx = 0
-
-            for i in range(50, len(df)):  # 跳过前 50 根用于指标 warmup
-                # 构建当前指标快照
-                current_values: dict[str, float] = {}
-                for key, series in indicator_values.items():
-                    if series is not None and i < len(series) and pd.notna(series.iloc[i]):
-                        current_values[key] = float(series.iloc[i])
-
-                # 也把 OHLCV 放进快照, 方便条件里引用 "close"/"volume" 等
-                price = float(df["close"].iloc[i])
-                current_values["open"] = float(df["open"].iloc[i]) if "open" in df.columns else price
-                current_values["high"] = float(df["high"].iloc[i]) if "high" in df.columns else price
-                current_values["low"] = float(df["low"].iloc[i]) if "low" in df.columns else price
-                current_values["close"] = price
-                if "volume" in df.columns and pd.notna(df["volume"].iloc[i]):
-                    current_values["volume"] = float(df["volume"].iloc[i])
-
-                if position_side is not None:
-                    # 检查止损止盈
-                    exit_reason = ""
-                    if strategy_spec.stop_loss_pct:
-                        sl_price = entry_price * (1 - strategy_spec.stop_loss_pct / 100)
-                        if position_side == "long" and price <= sl_price:
-                            exit_reason = "stop_loss"
-                        elif position_side == "short" and price >= entry_price * (1 + strategy_spec.stop_loss_pct / 100):
-                            exit_reason = "stop_loss"
-
-                    if not exit_reason and strategy_spec.take_profit_pct:
-                        tp_price = entry_price * (1 + strategy_spec.take_profit_pct / 100)
-                        if position_side == "long" and price >= tp_price:
-                            exit_reason = "take_profit"
-                        elif position_side == "short" and price <= entry_price * (1 - strategy_spec.take_profit_pct / 100):
-                            exit_reason = "take_profit"
-
-                    # 检查信号出场
-                    if not exit_reason:
-                        # exit_conditions: OR 逻辑
-                        if strategy_spec.exit_conditions:
-                            def _cond_dir(c: dict[str, Any]) -> str | None:
-                                d = c.get("direction")
-                                if d is None:
-                                    return None
-                                d = str(d).lower()
-                                return d if d in ("long", "short") else None
-
-                            for cond in strategy_spec.exit_conditions:
-                                d = _cond_dir(cond)
-                                if d is not None and d != position_side:
-                                    continue
-                                if self._eval_pandas_condition(cond, current_values):
-                                    exit_reason = "signal"
-                                    break
-
-                    if exit_reason:
-                        if position_side == "long":
-                            pnl = (price - entry_price) / entry_price * 100
-                        else:
-                            pnl = (entry_price - price) / entry_price * 100
-
-                        all_trades.append({
-                            "symbol": symbol,
-                            "side": position_side,
-                            "entry_price": entry_price,
-                            "exit_price": price,
-                            "pnl_pct": pnl,
-                            "exit_reason": exit_reason,
-                            "hold_bars": i - entry_idx,
-                            "exit_timestamp": df.index[i],  # 保存时间戳用于权益曲线
-                        })
-                        position_side = None
-
+        # Avg hold time
+        if "Entry Timestamp" in records.columns and "Exit Timestamp" in records.columns:
+            closed = records[records["Status"] == "Closed"] if "Status" in records.columns else records
+            if len(closed) > 0:
+                durations = pd.to_datetime(closed["Exit Timestamp"]) - pd.to_datetime(closed["Entry Timestamp"])
+                avg_hold_sec = durations.dt.total_seconds().mean()
+                if avg_hold_sec >= 86400:
+                    metrics["avg_hold_time"] = f"{avg_hold_sec / 86400:.1f}d"
                 else:
-                    # 检查入场
-                    def _cond_dir(c: dict[str, Any]) -> str | None:
-                        d = c.get("direction")
-                        if d is None:
-                            return None
-                        d = str(d).lower()
-                        return d if d in ("long", "short") else None
+                    metrics["avg_hold_time"] = f"{avg_hold_sec / 3600:.1f}h"
 
-                    def _all_met(conds: list[dict[str, Any]]) -> bool:
-                        return bool(conds) and all(self._eval_pandas_condition(c, current_values) for c in conds)
+        # Max consecutive losses
+        if len(pnl_col) > 0:
+            is_loss = (pnl_col < 0).astype(int)
+            streaks = is_loss.groupby((is_loss != is_loss.shift()).cumsum())
+            max_consec = max((g.sum() for _, g in streaks), default=0)
+            metrics["max_consecutive_losses"] = int(max_consec)
 
-                    entry_conds = strategy_spec.entry_conditions or []
+        # Top 5 / Bottom 5 trades
+        if len(pnl_col) >= 3:
+            sorted_pnl = pnl_col.sort_values()
+            n = min(5, len(sorted_pnl))
+            metrics["top_trades"] = [round(float(v), 2) for v in sorted_pnl.iloc[-n:][::-1]]
+            metrics["bottom_trades"] = [round(float(v), 2) for v in sorted_pnl.iloc[:n]]
 
-                    # 默认单向: entry_conditions 是 AND
-                    if strategy_spec.direction in ("long", "short"):
-                        side = strategy_spec.direction
-                        relevant = []
-                        for c in entry_conds:
-                            d = _cond_dir(c)
-                            if d is not None and d != side:
-                                continue
-                            relevant.append(c)
+        # Monthly P&L attribution
+        if "Exit Timestamp" in records.columns:
+            closed = records[records["Status"] == "Closed"] if "Status" in records.columns else records
+            if len(closed) > 0:
+                monthly_df = closed.copy()
+                monthly_df["month"] = pd.to_datetime(monthly_df["Exit Timestamp"]).dt.to_period("M")
+                monthly_pnl = monthly_df.groupby("month")["PnL"].sum()
+                metrics["monthly_pnl"] = {
+                    str(k): round(float(v), 2) for k, v in monthly_pnl.items()
+                }
 
-                        if _all_met(relevant):
-                            position_side = side
-                            entry_price = price
-                            entry_idx = i
+    # Equity curve (sampled for transport — max 500 points)
+    if len(equity) > 0:
+        step = max(1, len(equity) // 500)
+        sampled = equity.iloc[::step]
+        metrics["equity_curve"] = [
+            {"t": str(ts)[:19], "v": round(float(v), 2)}
+            for ts, v in zip(sampled.index, sampled.values)
+        ]
 
-                    # 双向: 如果条件里带 direction, 则按多/空分组分别 AND, 多空之间 OR
-                    else:
-                        long_specific = [c for c in entry_conds if _cond_dir(c) == "long"]
-                        short_specific = [c for c in entry_conds if _cond_dir(c) == "short"]
-                        neutral = [c for c in entry_conds if _cond_dir(c) is None]
+    # Benchmark (buy & hold)
+    if len(df) > 1:
+        bh_return = (float(df["close"].iloc[-1]) / float(df["close"].iloc[0]) - 1) * 100
+        metrics["benchmark_return_pct"] = round(bh_return, 4)
+        metrics["excess_return_pct"] = round(metrics["total_return_pct"] - bh_return, 4)
+        # Benchmark equity curve for chart overlay
+        base_price = float(df["close"].iloc[0])
+        bh_equity = starting_balance * (df["close"] / base_price)
+        step = max(1, len(bh_equity) // 500)
+        sampled_bh = bh_equity.iloc[::step]
+        metrics["benchmark_curve"] = [
+            {"t": str(ts)[:19], "v": round(float(v), 2)}
+            for ts, v in zip(sampled_bh.index, sampled_bh.values)
+        ]
 
-                        # 保守策略: 没有显式 short 条件就不做空; 没有显式 long 条件则用 neutral 作为做多
-                        long_enabled = bool(long_specific) or (not long_specific and not short_specific)
-                        short_enabled = bool(short_specific)
+    return metrics
 
-                        long_conds = (neutral + long_specific) if long_specific else neutral
-                        short_conds = (neutral + short_specific) if short_specific else []
 
-                        long_signal = long_enabled and _all_met(long_conds)
-                        short_signal = short_enabled and _all_met(short_conds)
+def _merge_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merge per-symbol results into a combined summary.
 
-                        if long_signal and not short_signal:
-                            position_side = "long"
-                            entry_price = price
-                            entry_idx = i
-                        elif short_signal and not long_signal:
-                            position_side = "short"
-                            entry_price = price
-                            entry_idx = i
-                        else:
-                            # 两边同时触发 (罕见/冲突) -> 跳过
-                            pass
+    IMPORTANT: per_symbol only contains compact summaries (no equity_curve,
+    no benchmark_curve, no monthly_pnl) to keep the JSON small enough for
+    LLM context windows.
+    """
+    valid = [r for r in results if "error" not in r]
+    failed = [r for r in results if "error" in r]
+    if not valid:
+        return {"error": "All symbols failed", "details": results}
 
-        # 汇总结果
-        if all_trades:
-            pnls = [t["pnl_pct"] for t in all_trades]
-            winners = [p for p in pnls if p > 0]
-            losers = [p for p in pnls if p < 0]
+    n = len(valid)
+    _avg = lambda key: round(sum(r.get(key, 0) for r in valid) / n, 4)
+    _max = lambda key: round(max(r.get(key, 0) for r in valid), 4)
+    _sum = lambda key: sum(r.get(key, 0) for r in valid)
 
-            result.total_trades = len(pnls)
-            result.win_rate = len(winners) / len(pnls) * 100
-            result.total_pnl = sum(pnls)
-            result.best_trade = max(pnls)
-            result.worst_trade = min(pnls)
+    # Compact per-symbol table (only key metrics, no large arrays)
+    _COMPACT_KEYS = [
+        "symbol", "total_return_pct", "win_rate_pct", "profit_factor",
+        "max_drawdown_pct", "total_trades", "sharpe_ratio",
+    ]
+    compact_per_symbol = [
+        {k: r.get(k) for k in _COMPACT_KEYS if r.get(k) is not None}
+        for r in valid
+    ]
+    # Sort by return descending for easy reading
+    compact_per_symbol.sort(key=lambda x: x.get("total_return_pct", 0), reverse=True)
 
-            if winners:
-                result.avg_win = sum(winners) / len(winners)
-            if losers:
-                result.avg_loss = sum(losers) / len(losers)
+    merged: dict[str, Any] = {
+        "symbols_count": n,
+        "per_symbol": compact_per_symbol,
+        # Portfolio (aggregate)
+        "starting_balance": valid[0].get("starting_balance", 100_000),
+        "total_return_pct": _avg("total_return_pct"),
+        "annualized_return_pct": _avg("annualized_return_pct"),
+        "net_profit": round(_sum("net_profit"), 2),
+        # Risk
+        "max_drawdown_pct": _max("max_drawdown_pct"),
+        "sharpe_ratio": _avg("sharpe_ratio"),
+        "sortino_ratio": _avg("sortino_ratio"),
+        "calmar_ratio": _avg("calmar_ratio"),
+        # Trades
+        "total_trades": _sum("total_trades"),
+        "win_rate_pct": _avg("win_rate_pct"),
+        "profit_factor": _avg("profit_factor"),
+        "expectancy": _avg("expectancy"),
+        "payoff_ratio": _avg("payoff_ratio"),
+        # Benchmark
+        "benchmark_return_pct": _avg("benchmark_return_pct"),
+        "excess_return_pct": _avg("excess_return_pct"),
+        # Period
+        "period_start": min(r.get("period_start", "") for r in valid),
+        "period_end": max(r.get("period_end", "") for r in valid),
+        "total_days": max(r.get("total_days", 0) for r in valid),
+    }
 
-            gross_profit = sum(winners) if winners else 0
-            gross_loss = abs(sum(losers)) if losers else 0
-            result.profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+    # Top 3 / Bottom 3 performers
+    by_return = sorted(valid, key=lambda r: r.get("total_return_pct", 0), reverse=True)
+    merged["top_performers"] = [
+        {"symbol": r["symbol"], "return_pct": r.get("total_return_pct", 0)}
+        for r in by_return[:3]
+    ]
+    merged["worst_performers"] = [
+        {"symbol": r["symbol"], "return_pct": r.get("total_return_pct", 0)}
+        for r in by_return[-3:]
+    ]
 
-            if result.total_trades > 0:
-                result.expectancy = result.total_pnl / result.total_trades
+    # Use first symbol's equity curve for the chart (kept internally, NOT in JSON response)
+    for r in valid:
+        if r.get("equity_curve"):
+            merged["_equity_curve"] = r["equity_curve"]
+            merged["_equity_symbol"] = r["symbol"]
+            if r.get("benchmark_curve"):
+                merged["_benchmark_curve"] = r["benchmark_curve"]
+            break
 
-            if result.total_days > 0:
-                result.annualized_return_pct = result.total_pnl * (365 / result.total_days)
+    # Aggregate monthly P&L across symbols
+    all_months: dict[str, float] = {}
+    for r in valid:
+        for month, pnl in r.get("monthly_pnl", {}).items():
+            all_months[month] = all_months.get(month, 0) + pnl
+    if all_months:
+        merged["monthly_pnl"] = {k: round(v, 2) for k, v in sorted(all_months.items())}
 
-            # Sharpe (简化)
-            if len(pnls) > 1:
-                mean_r = sum(pnls) / len(pnls)
-                std_r = (sum((p - mean_r) ** 2 for p in pnls) / (len(pnls) - 1)) ** 0.5
-                if std_r > 0:
-                    result.sharpe_ratio = (mean_r / std_r) * (252 ** 0.5)
+    if failed:
+        merged["failed_symbols"] = [r.get("symbol", "?") for r in failed]
 
-            # 平均持仓时间
-            hold_bars = [t["hold_bars"] for t in all_trades]
-            avg_bars = sum(hold_bars) / len(hold_bars) if hold_bars else 0
-            tf_seconds = OHLCVLoader.timeframe_to_seconds(strategy_spec.timeframe)
-            avg_hours = avg_bars * tf_seconds / 3600
-            if avg_hours >= 24:
-                result.avg_hold_time = f"{avg_hours / 24:.1f} days"
-            else:
-                result.avg_hold_time = f"{avg_hours:.1f} hours"
+    return merged
 
-            # 构建权益曲线数据
-            equity = 100.0  # 初始权益 100%
-            peak_equity = 100.0
-            equity_points = [{"timestamp": result.period_start, "equity": equity, "drawdown": 0.0}]
 
-            for trade in all_trades:
-                # 更新权益
-                equity += trade["pnl_pct"]
+def _safe_float(val: Any) -> float:
+    """Convert to float, handling inf/nan."""
+    try:
+        f = float(val)
+        if math.isinf(f) or math.isnan(f):
+            return 0.0
+        return round(f, 4)
+    except (TypeError, ValueError):
+        return 0.0
 
-                # 计算回撤
-                if equity > peak_equity:
-                    peak_equity = equity
-                drawdown = ((equity - peak_equity) / peak_equity * 100) if peak_equity > 0 else 0
 
-                # 添加数据点
-                timestamp = trade.get("exit_timestamp")
-                if timestamp:
-                    equity_points.append({
-                        "timestamp": str(timestamp),
-                        "equity": equity,
-                        "drawdown": drawdown,
-                    })
+# ═══════════════════════════════════════════════════════
+# Chart generation (optional artifact)
+# ═══════════════════════════════════════════════════════
 
-            result.equity_curve = equity_points
+def generate_chart(
+    metrics: dict[str, Any],
+    save_dir: Path | None = None,
+) -> str | None:
+    """Generate a professional multi-panel backtest dashboard.
 
-            # 更新最大回撤
-            if equity_points:
-                result.max_drawdown_pct = abs(min(p["drawdown"] for p in equity_points))
+    Panels:
+      1. Equity curve + benchmark overlay + peak line
+      2. Drawdown area chart
+      3. Monthly P&L heatmap
+      4. Key metrics summary box
 
-        return result
+    Returns file path or None if no equity data.
+    """
+    # Support both single-symbol (equity_curve) and multi-symbol (_equity_curve) layouts
+    curve = metrics.get("equity_curve") or metrics.get("_equity_curve")
+    if not curve:
+        return None
 
-    @staticmethod
-    def _eval_pandas_condition(cond: dict[str, Any], values: dict[str, float]) -> bool:
-        """评估单个条件 (pandas 引擎用)."""
-        try:
-            ind_key = cond["indicator"]
-            ind_field = cond.get("field", "value")
-            op = cond["operator"]
-            threshold = cond["value"]
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+    except ImportError:
+        logger.warning("matplotlib not installed, skipping chart")
+        return None
 
-            # 获取当前值
-            lookup_key = ind_key if ind_field == "value" else f"{ind_key}_{ind_field}"
-            current = values.get(lookup_key)
-            # 兼容多输出指标 (如 macd_value) 仍然用 field="value" 访问
-            if current is None and ind_field == "value":
-                current = values.get(f"{ind_key}_value")
-            if current is None:
-                return False
+    try:
+        plt.style.use("seaborn-v0_8-whitegrid")
+    except Exception:
+        pass
 
-            # 阈值可能是另一个指标
-            if isinstance(threshold, str) and "." in threshold:
-                ref_key, ref_field = threshold.split(".", 1)
-                ref_lookup = ref_key if ref_field == "value" else f"{ref_key}_{ref_field}"
-                threshold = values.get(ref_lookup)
-                if threshold is None and ref_field == "value":
-                    threshold = values.get(f"{ref_key}_value")
-                if threshold is None:
-                    return False
-            # 阈值也可能直接引用 OHLCV, 例如 "close"
-            elif isinstance(threshold, str):
-                if threshold in values:
-                    threshold = values[threshold]
+    timestamps = pd.to_datetime([p["t"] for p in curve])
+    equity_vals = np.array([p["v"] for p in curve], dtype=float)
+    start_val = float(metrics.get("starting_balance", equity_vals[0]))
 
-            threshold = float(threshold)
+    # Benchmark curve
+    bench_curve = metrics.get("benchmark_curve") or metrics.get("_benchmark_curve", [])
+    has_bench = len(bench_curve) > 0
 
-            if op == "lt":
-                return current < threshold
-            elif op == "gt":
-                return current > threshold
-            elif op == "lte":
-                return current <= threshold
-            elif op == "gte":
-                return current >= threshold
-            elif op == "eq":
-                return abs(current - threshold) < 1e-8
-            else:
-                return False
-        except Exception:
-            return False
+    # Monthly P&L
+    monthly_pnl = metrics.get("monthly_pnl", {})
+    has_monthly = len(monthly_pnl) > 0
 
-    # ─────────────── 自定义策略文件回测 ───────────────
+    # Layout: 3 rows x 2 cols
+    fig = plt.figure(figsize=(16, 10))
+    grid = fig.add_gridspec(
+        3, 2,
+        height_ratios=[3.0, 1.5, 2.0],
+        hspace=0.35, wspace=0.25,
+    )
+    ax_eq = fig.add_subplot(grid[0, :])      # full-width equity
+    ax_dd = fig.add_subplot(grid[1, :])      # full-width drawdown
+    ax_heat = fig.add_subplot(grid[2, 0])    # monthly heatmap
+    ax_stats = fig.add_subplot(grid[2, 1])   # metrics box
 
-    async def run_custom(
-        self,
-        strategy_file: str,
-        ohlcv_data: dict[str, pd.DataFrame],
-        starting_balance: float = 100_000.0,
-    ) -> BacktestResult:
-        """加载用户 .py 文件中的策略并运行回测.
+    # ── Panel 1: Equity + Benchmark + Peak ──
+    eq_series = pd.Series(equity_vals, index=timestamps)
+    peak = eq_series.cummax()
 
-        Args:
-            strategy_file: 策略 .py 文件路径.
-            ohlcv_data: OHLCV 数据.
-            starting_balance: 初始资金.
+    ax_eq.plot(timestamps, equity_vals, color="#1d4ed8", linewidth=2.0, label="Strategy")
+    ax_eq.plot(timestamps, peak.values, color="#94a3b8", linewidth=1.2, linestyle="--", label="Peak", alpha=0.7)
+    ax_eq.axhline(start_val, color="#6b7280", linestyle=":", linewidth=1.0, alpha=0.6)
 
-        用户策略要求:
-            - 必须继承 nautilus_trader.trading.strategy.Strategy
-            - 如果有自定义 StrategyConfig，必须包含 instrument_id 字段
-            - on_bar() 方法接收 bar 数据
-        """
-        if not _NT_AVAILABLE:
-            return BacktestResult(
-                success=False,
-                error="nautilus_trader not installed. Custom strategy requires Nautilus Trader.",
-            )
+    if has_bench:
+        bench_ts = pd.to_datetime([p["t"] for p in bench_curve])
+        bench_vals = [p["v"] for p in bench_curve]
+        ax_eq.plot(bench_ts, bench_vals, color="#f59e0b", linewidth=1.6, linestyle="-.", label="Buy & Hold")
 
-        strategy_path = Path(strategy_file)
-        if not strategy_path.exists():
-            return BacktestResult(success=False, error=f"Strategy file not found: {strategy_file}")
+    ax_eq.fill_between(timestamps, equity_vals, start_val,
+                       where=equity_vals >= start_val,
+                       color="#22c55e", alpha=0.12, interpolate=True)
+    ax_eq.fill_between(timestamps, equity_vals, start_val,
+                       where=equity_vals < start_val,
+                       color="#ef4444", alpha=0.10, interpolate=True)
 
-        try:
-            # 动态导入策略模块
-            module_name = f"user_strategy_{strategy_path.stem}_{uuid.uuid4().hex[:4]}"
-            spec = importlib.util.spec_from_file_location(module_name, strategy_path)
-            if spec is None or spec.loader is None:
-                return BacktestResult(success=False, error=f"Cannot load module from {strategy_file}")
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = module
-            spec.loader.exec_module(module)
-
-            # 查找 Strategy 子类和 StrategyConfig 子类
-            from nautilus_trader.trading.strategy import Strategy as NTStrategy, StrategyConfig as NTConfig
-
-            strategy_cls = None
-            config_cls = None
-            for attr_name in dir(module):
-                attr = getattr(module, attr_name)
-                if isinstance(attr, type):
-                    if issubclass(attr, NTStrategy) and attr is not NTStrategy:
-                        strategy_cls = attr
-                    if issubclass(attr, NTConfig) and attr is not NTConfig:
-                        config_cls = attr
-
-            if strategy_cls is None:
-                return BacktestResult(success=False, error="No Strategy subclass found in file")
-
-            logger.info(f"Loaded custom strategy: {strategy_cls.__name__} from {strategy_file}")
-
-            # 在线程中运行同步回测引擎
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None,
-                self._run_custom_nautilus,
-                ohlcv_data,
-                strategy_cls,
-                config_cls,
-                starting_balance,
-            )
-            return result
-
-        except Exception as e:
-            logger.exception(f"Failed to run custom strategy: {e}")
-            return BacktestResult(success=False, error=f"Failed to run custom strategy: {e}")
-
-    def _run_custom_nautilus(
-        self,
-        ohlcv_data: dict[str, pd.DataFrame],
-        strategy_cls: type,
-        config_cls: type | None,
-        starting_balance: float,
-    ) -> BacktestResult:
-        """使用 Nautilus Trader BacktestEngine 执行自定义策略回测."""
-        from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
-        from nautilus_trader.model import BarType, Venue, Money, Currency
-        from nautilus_trader.model.enums import AccountType, OmsType
-        from nautilus_trader.config import LoggingConfig
-        from nautilus_trader.test_kit.providers import TestInstrumentProvider
-        from nautilus_trader.backtest.models import FillModel
-        from nautilus_trader.model.data import Bar
-        from nautilus_trader.model import Price, Quantity
-        from nautilus_trader.core.datetime import dt_to_unix_nanos
-        from nautilus_trader.trading.strategy import StrategyConfig as NTConfig
-
-        result = BacktestResult(
-            strategy_name=strategy_cls.__name__,
-            symbols=list(ohlcv_data.keys()),
-            timeframe="custom",
+    # Mark max drawdown point
+    dd_vals = (eq_series / peak - 1) * 100
+    dd_min_idx = dd_vals.idxmin()
+    if pd.notna(dd_min_idx):
+        ax_eq.scatter([dd_min_idx], [eq_series.loc[dd_min_idx]], color="#dc2626", s=40, zorder=5)
+        ax_eq.annotate(
+            f"Max DD {dd_vals.min():.1f}%",
+            xy=(dd_min_idx, eq_series.loc[dd_min_idx]),
+            xytext=(10, -18), textcoords="offset points", fontsize=8, color="#991b1b",
+            bbox={"boxstyle": "round,pad=0.2", "fc": "#fee2e2", "ec": "#fecaca"},
         )
 
+    # Build a short symbols label (max 3 shown, rest counted)
+    all_symbols = metrics.get("symbols", [metrics.get("symbol", "")])
+    if isinstance(all_symbols, list) and len(all_symbols) > 3:
+        symbols_str = ", ".join(all_symbols[:3]) + f" +{len(all_symbols) - 3} more"
+    elif isinstance(all_symbols, list):
+        symbols_str = ", ".join(all_symbols)
+    else:
+        symbols_str = str(all_symbols)
+    n_symbols = metrics.get("symbols_count", 1)
+    title_suffix = f" ({n_symbols} symbols)" if n_symbols > 1 else ""
+
+    ax_eq.set_title(
+        f"{metrics.get('strategy_name', '')}{title_suffix} | "
+        f"{metrics.get('period_start', '')} → {metrics.get('period_end', '')}",
+        fontsize=12, fontweight="bold",
+    )
+    ax_eq.set_ylabel("Equity", fontsize=10)
+    ax_eq.legend(loc="upper left", fontsize=9, ncol=4)
+    ax_eq.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+
+    # ── Panel 2: Drawdown ──
+    ax_dd.fill_between(timestamps, dd_vals.values, 0, color="#ef4444", alpha=0.35)
+    ax_dd.plot(timestamps, dd_vals.values, color="#b91c1c", linewidth=1.0)
+    ax_dd.axhline(0, color="#6b7280", linestyle=":", linewidth=0.8)
+    ax_dd.set_ylabel("Drawdown %", fontsize=10)
+    ax_dd.set_title("Drawdown", fontsize=10, fontweight="bold")
+    ax_dd.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+
+    # ── Panel 3: Monthly heatmap ──
+    ax_heat.set_title("Monthly P&L", fontsize=10, fontweight="bold")
+    if has_monthly:
         try:
-            # 1. 配置引擎
-            engine = BacktestEngine(
-                config=BacktestEngineConfig(
-                    logging=LoggingConfig(log_level="ERROR"),
-                )
-            )
+            month_series = pd.Series(monthly_pnl, dtype=float)
+            month_series.index = pd.PeriodIndex(month_series.index, freq="M")
+            pivot = month_series.groupby([month_series.index.year, month_series.index.month]).sum().unstack()
+            pivot = pivot.reindex(columns=range(1, 13))
 
-            # 2. 添加模拟交易所
-            venue = Venue("BINANCE")
-            engine.add_venue(
-                venue=venue,
-                oms_type=OmsType.NETTING,
-                account_type=AccountType.MARGIN,
-                base_currency=Currency.from_str("USDT"),
-                starting_balances=[Money(starting_balance, Currency.from_str("USDT"))],
-                fill_model=FillModel(),
-            )
-
-            # 3. 添加 instrument 和数据
-            instrument = TestInstrumentProvider.ethusdt_perp_binance()
-            engine.add_instrument(instrument)
-
-            for symbol, df in ohlcv_data.items():
-                if df.empty:
-                    continue
-
-                bar_type = BarType.from_str(f"{instrument.id}-1-MINUTE-LAST-EXTERNAL")
-
-                result.period_start = str(df.index[0])[:10]
-                result.period_end = str(df.index[-1])[:10]
-                delta = df.index[-1] - df.index[0]
-                result.total_days = max(delta.days, 1)
-
-                bars = []
-                price_precision = instrument.price_precision
-                size_precision = instrument.size_precision
-
-                for ts, row in df.iterrows():
-                    bar = Bar(
-                        bar_type=bar_type,
-                        open=Price(round(float(row["open"]), price_precision), price_precision),
-                        high=Price(round(float(row["high"]), price_precision), price_precision),
-                        low=Price(round(float(row["low"]), price_precision), price_precision),
-                        close=Price(round(float(row["close"]), price_precision), price_precision),
-                        volume=Quantity(round(float(row["volume"]), size_precision), size_precision),
-                        ts_event=dt_to_unix_nanos(ts),
-                        ts_init=dt_to_unix_nanos(ts),
-                    )
-                    bars.append(bar)
-
-                engine.add_data(bars)
-                logger.info(f"Added {len(bars)} bars to custom strategy engine for {symbol}")
-
-            # 4. 创建策略实例
-            if config_cls is not None:
-                # 用户定义了 StrategyConfig 子类
-                try:
-                    config = config_cls(instrument_id=instrument.id)
-                except TypeError:
-                    # 可能 config_cls 有其他必需参数
-                    config = config_cls()
-                strategy = strategy_cls(config=config)
-            else:
-                # 使用默认的空 config
-                strategy = strategy_cls()
-
-            engine.add_strategy(strategy)
-            logger.info(f"Running custom strategy: {strategy_cls.__name__}")
-
-            # 5. 运行回测
-            engine.run()
-
-            # 6. 提取结果（复用 _run_backtest_nautilus 的逻辑）
-            positions = engine.trader.generate_positions_report()
-            orders = engine.trader.generate_order_fills_report()
-
-            if len(positions) > 0:
-                positions["pnl_numeric"] = positions["realized_pnl"].apply(
-                    lambda x: float(str(x).replace(" USDT", "").replace(",", ""))
-                    if isinstance(x, str) else float(x)
-                )
-                winners = positions[positions["pnl_numeric"] > 0]
-                losers = positions[positions["pnl_numeric"] < 0]
-
-                result.total_trades = len(positions)
-                result.win_rate = len(winners) / len(positions) * 100 if len(positions) > 0 else 0
-                result.total_pnl = positions["pnl_numeric"].sum()
-                result.best_trade = positions["pnl_numeric"].max()
-                result.worst_trade = positions["pnl_numeric"].min()
-
-                if len(winners) > 0:
-                    result.avg_win = winners["pnl_numeric"].mean()
-                if len(losers) > 0:
-                    result.avg_loss = losers["pnl_numeric"].mean()
-
-                gross_profit = winners["pnl_numeric"].sum() if len(winners) > 0 else 0
-                gross_loss = abs(losers["pnl_numeric"].sum()) if len(losers) > 0 else 0
-                result.profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
-
-                if result.total_trades > 0:
-                    result.expectancy = result.total_pnl / result.total_trades
-
-                if result.total_days > 0:
-                    result.annualized_return_pct = (result.total_pnl / starting_balance) * (365 / result.total_days) * 100
-
-                if len(positions) > 1:
-                    returns = positions["pnl_numeric"] / starting_balance
-                    if returns.std() > 0:
-                        result.sharpe_ratio = (returns.mean() / returns.std()) * (252 ** 0.5)
-
-                result.positions_report = positions.to_string()
-                result.orders_report = orders.to_string() if len(orders) > 0 else ""
-
-                # 构建 equity_curve
-                equity_curve = self._build_equity_curve_from_positions(
-                    positions=positions,
-                    starting_balance=starting_balance,
-                    period_start=result.period_start,
-                )
-                result.equity_curve = equity_curve
-
-                if equity_curve:
-                    result.max_drawdown_pct = abs(min(p["drawdown"] for p in equity_curve))
-
-            engine.dispose()
-            result.success = True
-            return result
-
+            vmax = float(np.nanmax(np.abs(pivot.values[np.isfinite(pivot.values)]))) if np.isfinite(pivot.values).any() else 1.0
+            vmax = max(vmax, 1.0)
+            heat = ax_heat.imshow(pivot.values, aspect="auto", cmap="RdYlGn", vmin=-vmax, vmax=vmax)
+            month_labels = ["J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D"]
+            ax_heat.set_xticks(range(12))
+            ax_heat.set_xticklabels(month_labels, fontsize=8)
+            ax_heat.set_yticks(range(len(pivot.index)))
+            ax_heat.set_yticklabels([str(y) for y in pivot.index], fontsize=8)
+            for r in range(pivot.shape[0]):
+                for c in range(pivot.shape[1]):
+                    val = pivot.iloc[r, c]
+                    if pd.notna(val):
+                        ax_heat.text(c, r, f"{val:.0f}", ha="center", va="center", fontsize=7,
+                                     color="#111827" if abs(val) < vmax * 0.6 else "white")
+            fig.colorbar(heat, ax=ax_heat, fraction=0.046, pad=0.04).ax.tick_params(labelsize=7)
         except Exception as e:
-            logger.exception(f"Custom strategy backtest error: {e}")
-            result.success = False
-            result.error = str(e)
-            return result
+            logger.warning(f"Monthly heatmap failed: {e}")
+            ax_heat.text(0.5, 0.5, "Insufficient monthly data", ha="center", va="center", fontsize=10)
+            ax_heat.set_axis_off()
+    else:
+        ax_heat.text(0.5, 0.5, "No monthly data", ha="center", va="center", fontsize=10)
+        ax_heat.set_axis_off()
 
-    # ─────────────── Paper Trading ───────────────
+    # ── Panel 4: Metrics summary box ──
+    ax_stats.axis("off")
+    pf_val = metrics.get("profit_factor", 0)
+    pf_text = f"{pf_val:.2f}" if pf_val < 100 else "∞"
 
-    async def start_paper(
-        self,
-        strategy_spec: StrategySpec,
-        api_key: str = "",
-        api_secret: str = "",
-        exchange: str = "binance",
-    ) -> PaperSession:
-        """启动 Paper Trading 会话 (Binance Testnet).
+    excess = metrics.get("excess_return_pct", 0)
+    bench_line = f"Benchmark Ret : {metrics.get('benchmark_return_pct', 0):+.2f}%"
+    excess_line = f"Excess Return : {excess:+.2f}%"
 
-        Args:
-            strategy_spec: 策略配置.
-            api_key: Binance testnet API key.
-            api_secret: Binance testnet API secret.
-            exchange: 交易所名称.
+    summary = "\n".join([
+        "PERFORMANCE",
+        "─" * 32,
+        f"Total Return  : {metrics.get('total_return_pct', 0):+.2f}%",
+        f"Annualized    : {metrics.get('annualized_return_pct', 0):+.2f}%",
+        f"Net Profit    : {metrics.get('net_profit', 0):+,.0f}",
+        bench_line,
+        excess_line,
+        "",
+        "RISK",
+        "─" * 32,
+        f"Max Drawdown  : {metrics.get('max_drawdown_pct', 0):.2f}%",
+        f"DD Duration   : {metrics.get('max_drawdown_duration_days', 0):.0f}d",
+        f"Sharpe        : {metrics.get('sharpe_ratio', 0):.2f}",
+        f"Sortino       : {metrics.get('sortino_ratio', 0):.2f}",
+        f"Calmar        : {metrics.get('calmar_ratio', 0):.2f}",
+        "",
+        "TRADES",
+        "─" * 32,
+        f"Total         : {metrics.get('total_trades', 0)}",
+        f"Win Rate      : {metrics.get('win_rate_pct', 0):.1f}%",
+        f"Profit Factor : {pf_text}",
+        f"Payoff Ratio  : {metrics.get('payoff_ratio', 0):.2f}",
+        f"Expectancy    : {metrics.get('expectancy', 0):.4f}",
+        f"Avg Hold      : {metrics.get('avg_hold_time', 'N/A')}",
+        f"Max Consec Loss: {metrics.get('max_consecutive_losses', 'N/A')}",
+    ])
+    ax_stats.text(
+        0.02, 0.98, summary,
+        transform=ax_stats.transAxes, va="top", ha="left",
+        fontsize=9, family="monospace",
+        bbox={"boxstyle": "round,pad=0.5", "fc": "#f8fafc", "ec": "#cbd5e1"},
+    )
 
-        Returns:
-            PaperSession 对象.
-        """
-        session_id = str(uuid.uuid4())[:8]
-        session = PaperSession(
-            session_id=session_id,
-            strategy_name=strategy_spec.name,
-            symbols=strategy_spec.symbols,
-            started_at=datetime.now(timezone.utc).isoformat(),
-            config_json=json.dumps(strategy_spec.to_json()),
-        )
+    # Suptitle
+    fig.suptitle(
+        f"Backtest Dashboard — {metrics.get('strategy_name', '')}",
+        fontsize=14, fontweight="bold", y=0.99,
+    )
+    plt.tight_layout(rect=[0, 0.01, 1, 0.97])
 
-        if not _NT_AVAILABLE:
-            session.status = "simulated"
-            self._paper_sessions[session_id] = session
-            logger.info(f"Paper trading session created (simulated mode): {session_id}")
-            return session
+    # Save
+    if save_dir is None:
+        import tempfile
+        save_dir = Path(tempfile.gettempdir()) / "getall_charts"
+    save_dir.mkdir(parents=True, exist_ok=True)
 
-        try:
-            from nautilus_trader.adapters.binance import BINANCE
-            from nautilus_trader.adapters.binance import BinanceLiveDataClientFactory
-            from nautilus_trader.adapters.binance import BinanceLiveExecClientFactory
-            from nautilus_trader.live.node import TradingNode, TradingNodeConfig
-            from nautilus_trader.config import LoggingConfig
+    name_token = re.sub(r"[^A-Za-z0-9._-]+", "_", metrics.get("strategy_name", "bt"))
+    filename = f"{name_token}_{uuid.uuid4().hex[:8]}.png"
+    path = save_dir / filename
+    plt.savefig(str(path), dpi=180, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    logger.info(f"Dashboard chart saved: {path}")
+    return str(path)
 
-            from getall.trading.backtest.strategies import (
-                TemplateStrategy,
-                TemplateStrategyConfig,
-            )
 
-            config = TradingNodeConfig(
-                logging=LoggingConfig(log_level="INFO"),
-                data_clients={
-                    BINANCE: {
-                        "api_key": api_key,
-                        "api_secret": api_secret,
-                        "account_type": "usdt_future",
-                        "testnet": True,
-                    },
-                },
-                exec_clients={
-                    BINANCE: {
-                        "api_key": api_key,
-                        "api_secret": api_secret,
-                        "account_type": "usdt_future",
-                        "testnet": True,
-                    },
-                },
-            )
+# ═══════════════════════════════════════════════════════
+# Data helpers (kept from old data_loader, slimmed down)
+# ═══════════════════════════════════════════════════════
 
-            node = TradingNode(config=config)
-            node.add_data_client_factory(BINANCE, BinanceLiveDataClientFactory)
-            node.add_exec_client_factory(BINANCE, BinanceLiveExecClientFactory)
-            node.build()
+def ccxt_to_dataframe(ohlcv_list: list[dict[str, Any]], symbol: str = "") -> pd.DataFrame:
+    """Convert ccxt OHLCV list[dict] to a standard DataFrame."""
+    if not ohlcv_list:
+        return pd.DataFrame()
+    df = pd.DataFrame(ohlcv_list)
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        df.set_index("timestamp", inplace=True)
+    for col in ("open", "high", "low", "close", "volume"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df.attrs["symbol"] = symbol
+    return df
 
-            # 注册策略
-            inst_id_str = OHLCVLoader.symbol_to_nautilus_id(
-                strategy_spec.symbols[0] if strategy_spec.symbols else "BTC/USDT",
-                "BINANCE",
-            )
-            from nautilus_trader.model import InstrumentId
-            strategy = TemplateStrategy(
-                config=TemplateStrategyConfig(
-                    instrument_id=InstrumentId.from_str(inst_id_str),
-                    strategy_spec_json=json.dumps(strategy_spec.to_json()),
-                )
-            )
-            node.trader.add_strategy(strategy)
 
-            # 启动 (后台运行)
-            task = asyncio.create_task(asyncio.to_thread(node.run))
-            session._node = node
-            session._task = task
-            session.status = "running"
+def timeframe_to_seconds(tf: str) -> int:
+    """Convert timeframe string (e.g. '4h') to seconds."""
+    multipliers = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+    unit = tf[-1].lower()
+    try:
+        value = int(tf[:-1])
+    except ValueError:
+        return 3600
+    return value * multipliers.get(unit, 60)
 
-            logger.info(f"Paper trading started on Binance testnet: {session_id}")
 
-        except ImportError as e:
-            session.status = "simulated"
-            logger.warning(f"Nautilus Binance adapter not available: {e}. Running in simulated mode.")
-        except Exception as e:
-            session.status = "error"
-            session.stopped_at = datetime.now(timezone.utc).isoformat()
-            logger.error(f"Failed to start paper trading: {e}")
-
-        self._paper_sessions[session_id] = session
-        return session
-
-    async def stop_paper(self, session_id: str) -> BacktestResult:
-        """停止 Paper Trading 会话并返回结果.
-
-        Args:
-            session_id: 会话 ID.
-
-        Returns:
-            BacktestResult 绩效结果.
-        """
-        session = self._paper_sessions.get(session_id)
-        if session is None:
-            return BacktestResult(success=False, error=f"Session not found: {session_id}")
-
-        session.stopped_at = datetime.now(timezone.utc).isoformat()
-        session.status = "stopped"
-
-        result = BacktestResult(
-            strategy_name=session.strategy_name,
-            symbols=session.symbols,
-            period_start=session.started_at[:10],
-            period_end=session.stopped_at[:10],
-        )
-
-        # 如果有 TradingNode, 停止并提取结果
-        if session._node is not None:
-            try:
-                node = session._node
-                node.stop()
-
-                # 提取交易结果
-                positions = node.trader.generate_positions_report()
-                orders = node.trader.generate_order_fills_report()
-
-                if len(positions) > 0:
-                    positions["pnl_numeric"] = positions["realized_pnl"].apply(
-                        lambda x: float(str(x).replace(" USDT", "").replace(",", ""))
-                        if isinstance(x, str) else float(x)
-                    )
-                    winners = positions[positions["pnl_numeric"] > 0]
-                    losers = positions[positions["pnl_numeric"] < 0]
-
-                    result.total_trades = len(positions)
-                    result.win_rate = len(winners) / len(positions) * 100 if len(positions) > 0 else 0
-                    result.total_pnl = positions["pnl_numeric"].sum()
-                    result.positions_report = positions.to_string()
-
-                node.dispose()
-            except Exception as e:
-                logger.error(f"Error stopping paper trading: {e}")
-                result.error = str(e)
-
-        # 取消后台 task
-        if session._task is not None and not session._task.done():
-            session._task.cancel()
-
-        logger.info(f"Paper trading stopped: {session_id}")
-        return result
-
-    def get_paper_session(self, session_id: str) -> PaperSession | None:
-        """获取 Paper Trading 会话信息."""
-        return self._paper_sessions.get(session_id)
-
-    def list_paper_sessions(self) -> list[PaperSession]:
-        """列出所有 Paper Trading 会话."""
-        return list(self._paper_sessions.values())
-
-    @staticmethod
-    def available_indicators() -> dict[str, dict[str, Any]]:
-        """返回所有可用的 Nautilus 内置指标列表."""
-        return NAUTILUS_INDICATORS
+def estimate_candle_count(period_str: str, timeframe: str) -> int:
+    """Estimate number of candles needed for a period + timeframe combo."""
+    unit = period_str[-1].lower()
+    try:
+        value = int(period_str[:-1])
+    except ValueError:
+        return 1000
+    period_days = {"d": value, "w": value * 7, "m": value * 30, "y": value * 365}.get(unit, value)
+    return int(period_days * 86400 / max(timeframe_to_seconds(timeframe), 1))

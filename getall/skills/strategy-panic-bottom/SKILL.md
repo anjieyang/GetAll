@@ -1,6 +1,6 @@
 ---
 name: strategy-panic-bottom
-description: "Fear & Greed panic buy strategy template. Scale into long positions during extreme market fear with whale accumulation and liquidation cascade confirmation."
+description: "Fear & Greed panic buy strategy template. Use when user asks about panic buying, fear greed strategy, contrarian buy, dip buying, bottom fishing, or 恐慌抄底."
 metadata: '{"getall":{"always":false}}'
 ---
 
