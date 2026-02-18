@@ -2,7 +2,9 @@
 
 import asyncio
 import json
+import mimetypes
 import re
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -42,7 +44,12 @@ from getall.agent.tools.finnhub import FinnhubTool
 from getall.agent.tools.freecrypto import FreeCryptoTool
 from getall.agent.tools.group_stats import GroupStatsTool
 from getall.agent.tools.persona import PetPersonaTool
+from getall.agent.tools.admin import AdminTool
+from getall.agent.tools.feedback import FeedbackTool
+from getall.agent.tools.browser_use import BrowserUseTool
+from getall.agent.tools.rss_news import RssNewsTool
 from getall.agent.tools.yfinance_tool import YFinanceTool
+from getall.agent.tools.akshare_tool import AKShareTool
 from getall.trading.data.hub import DataHub
 from getall.agent.memory import MemoryStore
 from getall.agent.subagent import SubagentManager
@@ -101,6 +108,146 @@ class AgentLoop:
         r"^\s*(?:\[\s*NO_REPLY\s*\]|<\s*NO_REPLY\s*>|NO_REPLY)\s*$",
         re.IGNORECASE,
     )
+
+    # ── Context-window budget constants ──
+    # Known context limits per model prefix.  Add new entries as needed.
+    _MODEL_CONTEXT_LIMITS: dict[str, int] = {
+        "claude": 200_000,
+        "maas_cl": 200_000,       # CloudsWay Claude proxies
+        "gpt-4o": 128_000,
+        "gpt-4": 128_000,
+        "gpt-codex": 128_000,
+        "deepseek": 128_000,
+        "qwen": 131_072,
+        "gemini": 1_000_000,
+        "minimax": 1_000_000,     # MiniMax M2.5 series
+    }
+    _DEFAULT_CONTEXT_LIMIT = 128_000
+    _CONTEXT_SAFETY_MARGIN = 8_000  # reserve for tool defs + overhead
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Fast token estimate for mixed CJK/Latin text.
+
+        Heuristic (no external dep):
+        - CJK ideographs ≈ 1 token each
+        - Everything else ≈ 1 token per 3.5 chars (English avg)
+        """
+        cjk = 0
+        other = 0
+        for ch in text:
+            cp = ord(ch)
+            # CJK Unified Ideographs + common CJK ranges
+            if (
+                0x4E00 <= cp <= 0x9FFF
+                or 0x3400 <= cp <= 0x4DBF
+                or 0xF900 <= cp <= 0xFAFF
+                or 0x20000 <= cp <= 0x2A6DF
+            ):
+                cjk += 1
+            else:
+                other += 1
+        return cjk + int(other / 3.5) + 1
+
+    @classmethod
+    def _estimate_messages_tokens(cls, messages: list[dict[str, Any]]) -> int:
+        """Estimate total tokens across all messages."""
+        total = 0
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                total += cls._estimate_tokens(content)
+            elif isinstance(content, list):
+                # Multimodal: text parts only
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        total += cls._estimate_tokens(part.get("text", ""))
+            # Tool calls in assistant messages
+            for tc in msg.get("tool_calls", []):
+                fn = tc.get("function", {})
+                total += cls._estimate_tokens(fn.get("arguments", ""))
+                total += cls._estimate_tokens(fn.get("name", ""))
+            # Per-message overhead (role, formatting)
+            total += 4
+        return total
+
+    def _get_context_limit(self, model: str) -> int:
+        """Resolve context window size for the active model."""
+        model_lower = model.lower()
+        for prefix, limit in self._MODEL_CONTEXT_LIMITS.items():
+            if prefix in model_lower:
+                return limit
+        return self._DEFAULT_CONTEXT_LIMIT
+
+    def _fit_messages_to_budget(
+        self,
+        messages: list[dict[str, Any]],
+        model: str,
+    ) -> list[dict[str, Any]]:
+        """Trim conversation history if total tokens would exceed context window.
+
+        Preserves: system prompt (idx 0), current user message (last),
+        and trims oldest history messages from the middle.
+
+        Returns a new list (original is not mutated).
+        """
+        context_limit = self._get_context_limit(model)
+        # Budget = context_limit - max_output_tokens - safety_margin
+        budget = context_limit - self.max_tokens - self._CONTEXT_SAFETY_MARGIN
+        if budget < 10_000:
+            budget = 10_000  # absolute minimum for a useful conversation
+
+        est = self._estimate_messages_tokens(messages)
+        if est <= budget:
+            return messages
+
+        # Need to trim.  Keep system (first) + user message (last).
+        # Remove oldest history messages until we fit.
+        logger.warning(
+            f"Context budget exceeded: ~{est} tokens > {budget} budget "
+            f"(model={model}, context_limit={context_limit}, max_tokens={self.max_tokens}). "
+            f"Trimming oldest history messages."
+        )
+
+        if len(messages) <= 2:
+            return messages
+
+        system_msg = messages[0]
+        current_user_msg = messages[-1]
+        history = list(messages[1:-1])
+
+        # Tokens consumed by fixed parts
+        fixed_tokens = (
+            self._estimate_messages_tokens([system_msg])
+            + self._estimate_messages_tokens([current_user_msg])
+        )
+        remaining = budget - fixed_tokens
+        if remaining < 1000:
+            # System prompt alone is too large; nothing we can do but send
+            # system + user and hope for the best.
+            logger.error(
+                f"System prompt alone uses ~{fixed_tokens} tokens, "
+                f"budget is {budget}. Sending with minimal history."
+            )
+            return [system_msg, current_user_msg]
+
+        # Keep history from the END (newest first), drop oldest
+        kept: list[dict[str, Any]] = []
+        used = 0
+        for msg in reversed(history):
+            msg_tokens = self._estimate_messages_tokens([msg])
+            if used + msg_tokens > remaining:
+                break
+            kept.append(msg)
+            used += msg_tokens
+        kept.reverse()
+
+        trimmed = len(history) - len(kept)
+        logger.info(
+            f"Trimmed {trimmed} oldest history messages. "
+            f"Keeping {len(kept)} ({used} tokens) + system + user."
+        )
+        return [system_msg, *kept, current_user_msg]
     
     def __init__(
         self,
@@ -149,6 +296,10 @@ class AgentLoop:
 
         # Voice provider (lazy: reads GETALL_OPENAI_API_KEY from env).
         self.voice = OpenAIVoiceProvider()
+
+        # Event system (time-limited personas / hidden events)
+        from getall.events.manager import EventManager
+        self.event_manager = EventManager(workspace)
         
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
@@ -171,9 +322,19 @@ class AgentLoop:
         
         self._running = False
         self._worker_tasks: list[asyncio.Task[None]] = []
-        self._session_locks: dict[str, asyncio.Lock] = {}
-        self._session_lock_refcounts: dict[str, int] = {}
-        self._session_lock_guard = asyncio.Lock()
+        # Buffer-based concurrency: buffer key presence = session active.
+        # New messages for an active session are appended to the buffer
+        # and drained by the agent loop at natural checkpoints.
+        self._pending_buffers: dict[str, list[InboundMessage]] = {}
+        self._pending_guard = asyncio.Lock()
+
+        # ── Message coalescing ──
+        # Media-only messages in private chats are held briefly so a
+        # follow-up text message can be merged before LLM processing.
+        self._coalescing_buffer: dict[str, list[InboundMessage]] = {}
+        self._coalescing_tasks: dict[str, asyncio.Task[None]] = {}
+        self._coalescing_lock = asyncio.Lock()
+
         self._register_default_tools()
     
     def _register_default_tools(self) -> None:
@@ -254,6 +415,14 @@ class AgentLoop:
         self._group_stats_tool = GroupStatsTool()
         self.tools.register(self._group_stats_tool)
 
+        # Admin tool (context set per-message based on principal role)
+        self._admin_tool = AdminTool()
+        self.tools.register(self._admin_tool)
+
+        # Feedback tool (available to all users; admin gets elevated permissions)
+        self._feedback_tool = FeedbackTool()
+        self.tools.register(self._feedback_tool)
+
         # Trading domain tools (all depend on DataHub, lazy-imported to avoid circular imports)
         try:
             from getall.trading.tools.backtest import BacktestTool
@@ -277,15 +446,100 @@ class AgentLoop:
         import os
         self.tools.register(CoinGeckoTool(api_key=os.environ.get("COINGECKO_API_KEY", "")))
         self.tools.register(YFinanceTool())
+        self.tools.register(AKShareTool())
 
         # DeFi & sentiment tools (free, no API key)
         self.tools.register(DefiLlamaTool())
         self.tools.register(FearGreedTool())
 
+        # RSS news aggregator (free, no API key — 7 English crypto outlets)
+        self.tools.register(RssNewsTool())
+
         # Financial data tools (API key required)
         self.tools.register(FinnhubTool(api_key=os.environ.get("FINNHUB_API_KEY", "")))
         self.tools.register(FreeCryptoTool(api_key=os.environ.get("FREECRYPTO_API_KEY", "")))
-    
+
+        # Browser automation tool (browser-use) — uses a dedicated OpenAI model
+        # that natively supports structured output + vision for reliable scraping.
+        _browser_api_key = os.environ.get("GETALL_OPENAI_API_KEY", "")
+        if _browser_api_key:
+            self.tools.register(BrowserUseTool(
+                model="gpt-5.2",
+                api_key=_browser_api_key,
+                timeout=180,
+            ))
+        else:
+            logger.warning("GETALL_OPENAI_API_KEY not set — browser_use tool disabled")
+
+    async def _get_active_model(self, chat_type: str | None = None) -> str:
+        """Resolve active model from system_config, falling back to self.model.
+
+        Checks ``model:private`` or ``model:group`` in the DB, falls back to
+        the default model configured at startup.
+        """
+        try:
+            from getall.storage.database import get_session_factory
+            from getall.storage.repository import SystemConfigRepo
+
+            key = f"model:{chat_type}" if chat_type in ("private", "group") else "model:private"
+            factory = get_session_factory()
+            async with factory() as session:
+                repo = SystemConfigRepo(session)
+                value = await repo.get(key)
+            if value:
+                return value
+        except Exception as exc:
+            logger.debug(f"Failed to load active model from DB: {exc}")
+        return self.model
+
+    async def _record_llm_usage(
+        self,
+        response: "LLMResponse",
+        *,
+        tenant_id: str = "default",
+        principal_id: str = "",
+        session_key: str = "",
+        call_type: str = "chat",
+    ) -> None:
+        """Persist a single LLM call's token usage and cost to the database.
+
+        Runs fire-and-forget inside a try/except so it never blocks the
+        main agent loop or surfaces errors to the user.
+        """
+        if not response.usage:
+            return
+        try:
+            from getall.storage.database import get_session_factory
+            from getall.storage.repository import LLMUsageRepo
+            from getall.storage.models import LLMUsageRecord
+
+            rec = LLMUsageRecord(
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                session_key=session_key,
+                model=response.model,
+                provider=self._detect_provider_name(response.model),
+                prompt_tokens=response.usage.get("prompt_tokens", 0),
+                completion_tokens=response.usage.get("completion_tokens", 0),
+                total_tokens=response.usage.get("total_tokens", 0),
+                cost_usd=f"{response.cost_usd:.8f}",
+                call_type=call_type,
+            )
+            factory = get_session_factory()
+            async with factory() as session:
+                repo = LLMUsageRepo(session)
+                await repo.record(rec)
+                await session.commit()
+        except Exception as exc:
+            logger.debug(f"Failed to record LLM usage: {exc}")
+
+    @staticmethod
+    def _detect_provider_name(model: str) -> str:
+        """Best-effort provider name from the resolved model string."""
+        if "/" in model:
+            return model.split("/")[0]  # e.g. "openrouter/..." → "openrouter"
+        return ""
+
     @staticmethod
     def _resolve_system_origin(chat_id: str) -> tuple[str, str]:
         """Parse system-message chat_id into origin channel/chat pair."""
@@ -294,17 +548,21 @@ class AgentLoop:
             return parts[0], parts[1]
         return "cli", chat_id
 
-    def _lock_key_for_message(
+    def _buffer_key_for_message(
         self,
         msg: InboundMessage,
         session_key: str | None = None,
     ) -> str:
-        """Compute processing lock key.
+        """Compute buffer key for mid-loop message injection.
 
         Strategy:
-        - Private/system flows: serialize per conversation.
-        - Group flows: serialize per sender within a chat, so different
+        - Private chats use ``channel:chat_id`` so that system messages
+          (reminders) share the same buffer key and can be injected into
+          an active user session.
+        - Group chats serialize per sender within a chat so different
           members can run concurrently while one member stays ordered.
+        - System messages resolve to ``origin_channel:origin_chat_id``
+          which matches the private-chat key of the target conversation.
         """
         if session_key:
             return session_key
@@ -314,76 +572,291 @@ class AgentLoop:
         if msg.chat_type == "group":
             sender = (msg.sender_id or "-").strip() or "-"
             return f"{msg.channel}:{msg.chat_id}:sender:{sender}"
-        return msg.session_key
+        return f"{msg.channel}:{msg.chat_id}"
 
-    async def _acquire_session_lock(self, lock_key: str) -> asyncio.Lock:
-        """Acquire serialized processing lock for a conversation key."""
-        async with self._session_lock_guard:
-            lock = self._session_locks.get(lock_key)
-            if lock is None:
-                lock = asyncio.Lock()
-                self._session_locks[lock_key] = lock
-            self._session_lock_refcounts[lock_key] = (
-                self._session_lock_refcounts.get(lock_key, 0) + 1
+    # ── Buffer helpers ────────────────────────────────────────────────
+
+    async def _drain_pending(self, buffer_key: str) -> list[InboundMessage]:
+        """Atomically drain all buffered messages for *buffer_key*.
+
+        Returns the list of messages (may be empty).  The buffer entry
+        itself is kept (only cleared) so new arrivals continue to be
+        buffered while the session is active.
+        """
+        async with self._pending_guard:
+            msgs = self._pending_buffers.get(buffer_key, [])
+            if msgs:
+                self._pending_buffers[buffer_key] = []
+            return msgs
+
+    _AUDIO_SUFFIXES = (".ogg", ".opus", ".mp3", ".wav", ".m4a")
+    _MAX_SESSION_MEDIA_BUFFER = 10
+
+    # Content patterns that indicate a turn involved media (protocol markers
+    # inserted by the channel layer, NOT user-facing text classification).
+    _MEDIA_CONTENT_MARKERS = ("[image]", "[sticker]", "[file:")
+
+    async def _inject_buffered_messages(
+        self,
+        pending: list[InboundMessage],
+        messages: list[dict[str, Any]],
+        session: Any,
+        llm_media: list[str] | None,
+    ) -> list[str] | None:
+        """Inject buffered messages into the live conversation context.
+
+        For each pending ``InboundMessage``:
+        - Audio messages are transcribed via STT.
+        - User messages are formatted (group sender prefix) and media is
+          base64-encoded for vision models.
+        - System messages (reminders) are injected as ``role: system``.
+        - Session history and ``_session_media`` are updated.
+
+        Returns the (possibly updated) *llm_media* list so the caller
+        can keep its reference current.
+        """
+        if not pending:
+            return llm_media
+
+        # ── Framing hint: tell the LLM these are live follow-ups ──
+        user_msgs = [m for m in pending if m.channel != "system"]
+        sys_msgs = [m for m in pending if m.channel == "system"]
+        if user_msgs:
+            messages.append({
+                "role": "system",
+                "content": (
+                    f"[The user sent {len(user_msgs)} additional message(s) "
+                    "while you were working. These are follow-ups or "
+                    "supplements to the current task — treat them as extra "
+                    "context / corrections / instructions. Act on them "
+                    "proactively; do NOT ask for clarification unless the "
+                    "intent is genuinely ambiguous.]"
+                ),
+            })
+
+        for p_msg in pending:
+            # ── Audio STT ──
+            is_audio = bool((p_msg.metadata or {}).get("is_audio"))
+            if is_audio and not p_msg.content:
+                transcribed = await self._transcribe_audio(p_msg)
+                p_msg.content = transcribed or "（语音消息，未能识别）"
+
+            # ── Media handling ──
+            p_media = [
+                m for m in (p_msg.media or [])
+                if not m.endswith(self._AUDIO_SUFFIXES)
+            ] or None
+
+            if p_media:
+                # Persist to session media store (for future reference).
+                existing: list[str] = session.metadata.get("_session_media", [])
+                merged = list(dict.fromkeys(existing + p_media))
+                merged = [p for p in merged if Path(p).is_file()]
+                session.metadata["_session_media"] = merged[
+                    -self._MAX_SESSION_MEDIA_BUFFER :
+                ]
+                # Track current-turn media only (no historical mixing).
+                if llm_media is None:
+                    llm_media = list(p_media)
+                else:
+                    llm_media = list(dict.fromkeys(llm_media + p_media))
+
+            # ── Build content and inject ──
+            if p_msg.channel == "system":
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "[A scheduled reminder fired while you were working. "
+                        "Decide whether to act on it now or after finishing "
+                        "the current task.]\n"
+                        f"{p_msg.content}"
+                    ),
+                })
+            else:
+                text = self._format_current_user_content(p_msg)
+                # Buffer-injected media is always "current" — no historical
+                # mixing; the annotation label comes from the media param.
+                user_content = self.context._build_user_content(
+                    text, media=p_media,
+                )
+                messages.append({"role": "user", "content": user_content})
+
+            # ── Persist to session history ──
+            hist_kwargs: dict[str, Any] = {"chat_type": p_msg.chat_type}
+            if is_audio:
+                hist_kwargs["voice"] = True
+            if p_msg.chat_type == "group":
+                hist_kwargs["sender_id"] = p_msg.sender_id
+                sender_name = self._sender_name_for_group(p_msg)
+                if sender_name:
+                    hist_kwargs["sender_name"] = sender_name
+            session.add_message(
+                "user" if p_msg.channel != "system" else "system",
+                p_msg.content,
+                **hist_kwargs,
             )
 
-        try:
-            await lock.acquire()
-        except BaseException:
-            async with self._session_lock_guard:
-                refs = self._session_lock_refcounts.get(lock_key, 0) - 1
-                if refs <= 0:
-                    self._session_lock_refcounts.pop(lock_key, None)
-                    current = self._session_locks.get(lock_key)
-                    if current is lock and not lock.locked():
-                        self._session_locks.pop(lock_key, None)
-                else:
-                    self._session_lock_refcounts[lock_key] = refs
-            raise
-        return lock
+        self.sessions.save(session)
+        n = len(pending)
+        logger.info(
+            f"Injected {n} buffered message(s) into active loop"
+        )
 
-    async def _release_session_lock(self, lock_key: str, lock: asyncio.Lock) -> None:
-        """Release serialized processing lock and cleanup idle lock entries."""
-        lock.release()
-        async with self._session_lock_guard:
-            refs = self._session_lock_refcounts.get(lock_key, 0) - 1
-            if refs <= 0:
-                self._session_lock_refcounts.pop(lock_key, None)
-                current = self._session_locks.get(lock_key)
-                if current is lock and not current.locked():
-                    self._session_locks.pop(lock_key, None)
-            else:
-                self._session_lock_refcounts[lock_key] = refs
+        return llm_media
 
-    async def _process_message_with_lock(
-        self,
-        msg: InboundMessage,
-        *,
-        session_key: str | None = None,
-    ) -> OutboundMessage | None:
-        """Serialize same-session messages while allowing cross-session concurrency."""
-        lock_key = self._lock_key_for_message(msg, session_key=session_key)
-        lock = await self._acquire_session_lock(lock_key)
-        try:
-            return await self._process_message(msg, session_key=session_key)
-        finally:
-            await self._release_session_lock(lock_key, lock)
+    # ── Message coalescing helpers ──────────────────────────────────
 
-    async def _process_inbound_message(self, msg: InboundMessage) -> None:
-        """Process one inbound message and publish outbound response."""
+    # Content placeholders that indicate a media-only message.
+    _MEDIA_PLACEHOLDER_RE = re.compile(
+        r"^\s*(?:\[image\]|\[sticker\]|\[file:\s*[^\]]*\])\s*$",
+        re.IGNORECASE,
+    )
+    _COALESCE_DELAY_SECONDS = 3.0
+
+    def _should_coalesce(self, msg: InboundMessage) -> bool:
+        """Return True when the message should wait for a follow-up.
+
+        Conditions: private chat, has media, and no meaningful user text
+        (content is just a placeholder like ``[image]``).
+        """
+        if msg.chat_type == "group":
+            return False
+        if not msg.media:
+            return False
+        return not self._has_meaningful_text(msg)
+
+    @staticmethod
+    def _has_meaningful_text(msg: InboundMessage) -> bool:
+        """True when the message carries real user-typed text."""
+        content = (msg.content or "").strip()
+        if not content:
+            return False
+        return not AgentLoop._MEDIA_PLACEHOLDER_RE.match(content)
+
+    @staticmethod
+    def _merge_coalesced(msgs: list[InboundMessage]) -> InboundMessage:
+        """Merge several buffered messages into a single InboundMessage.
+
+        Media paths are deduplicated; text parts are concatenated.
+        Metadata and routing fields come from the *first* message.
+        """
+        base = msgs[0]
+        all_media: list[str] = []
+        text_parts: list[str] = []
+        for m in msgs:
+            if m.media:
+                all_media.extend(m.media)
+            if AgentLoop._has_meaningful_text(m):
+                text_parts.append(m.content.strip())
+
+        merged_content = "\n".join(text_parts) if text_parts else base.content
+        merged_media = list(dict.fromkeys(all_media))  # dedupe, preserve order
+
+        return InboundMessage(
+            channel=base.channel,
+            sender_id=base.sender_id,
+            chat_id=base.chat_id,
+            content=merged_content,
+            timestamp=base.timestamp,
+            media=merged_media,
+            metadata=base.metadata,
+            tenant_id=base.tenant_id,
+            principal_id=base.principal_id,
+            agent_identity_id=base.agent_identity_id,
+            thread_id=base.thread_id,
+            sender_name=base.sender_name,
+            chat_type=base.chat_type,
+        )
+
+    async def _fire_coalesced(self, buffer_key: str) -> None:
+        """Timer callback: coalescing window expired, process collected messages."""
+        await asyncio.sleep(self._COALESCE_DELAY_SECONDS)
+        async with self._coalescing_lock:
+            msgs = self._coalescing_buffer.pop(buffer_key, None)
+            self._coalescing_tasks.pop(buffer_key, None)
+        if not msgs:
+            return
+        merged = self._merge_coalesced(msgs)
+        logger.info(
+            f"Coalescing window expired for {buffer_key}: "
+            f"{len(msgs)} msg(s) merged, media={len(merged.media)}"
+        )
+        await self._dispatch_inbound(merged)
+
+    async def _dispatch_inbound(self, msg: InboundMessage) -> None:
+        """Common path that buffers or processes a (possibly merged) message."""
+        buffer_key = self._buffer_key_for_message(msg)
+
+        async with self._pending_guard:
+            if buffer_key in self._pending_buffers:
+                self._pending_buffers[buffer_key].append(msg)
+                preview = (msg.content or "")[:60]
+                logger.info(
+                    f"Buffered message for active session {buffer_key}: "
+                    f"{preview!r}"
+                )
+                return
+            self._pending_buffers[buffer_key] = []
+
         try:
-            response = await self._process_message_with_lock(msg)
+            response = await self._process_message(
+                msg, buffer_key=buffer_key,
+            )
             if response:
                 await self.bus.publish_outbound(response)
         except Exception as e:
             logger.error(f"Error processing message: {e}", exc_info=True)
-            # Send user-friendly error (raw details stay in logs)
             await self.bus.publish_outbound(OutboundMessage(
                 channel=msg.channel,
                 chat_id=msg.chat_id,
                 content="出了点小问题，请稍后再试。如果持续出错请联系管理员。",
                 metadata=msg.metadata or {},
             ))
+        finally:
+            async with self._pending_guard:
+                remaining = self._pending_buffers.pop(buffer_key, [])
+            for queued in remaining:
+                await self.bus.publish_inbound(queued)
+
+    async def _process_inbound_message(self, msg: InboundMessage) -> None:
+        """Process one inbound message; coalesce or buffer if needed."""
+        buffer_key = self._buffer_key_for_message(msg)
+
+        # ── Coalescing: merge media-only → text follow-ups ──
+        async with self._coalescing_lock:
+            # 1. An existing coalescing window is open for this session.
+            if buffer_key in self._coalescing_buffer:
+                self._coalescing_buffer[buffer_key].append(msg)
+                if self._has_meaningful_text(msg):
+                    # Text arrived — cancel timer, process immediately.
+                    task = self._coalescing_tasks.pop(buffer_key, None)
+                    if task:
+                        task.cancel()
+                    msgs = self._coalescing_buffer.pop(buffer_key, [])
+                    merged = self._merge_coalesced(msgs)
+                    logger.info(
+                        f"Coalescing early trigger for {buffer_key}: "
+                        f"{len(msgs)} msg(s) merged, media={len(merged.media)}"
+                    )
+                else:
+                    # Another media-only msg; stay in window.
+                    return
+                # Fall through to dispatch the merged message.
+                msg = merged
+
+            # 2. New message that qualifies for coalescing.
+            elif self._should_coalesce(msg):
+                self._coalescing_buffer[buffer_key] = [msg]
+                task = asyncio.create_task(self._fire_coalesced(buffer_key))
+                self._coalescing_tasks[buffer_key] = task
+                logger.debug(
+                    f"Coalescing window opened for {buffer_key} "
+                    f"({self._COALESCE_DELAY_SECONDS}s)"
+                )
+                return
+
+        # ── Normal dispatch (buffer-or-process) ──
+        await self._dispatch_inbound(msg)
 
     async def _worker_loop(self, worker_id: int) -> None:
         """Worker loop consuming inbound queue concurrently."""
@@ -505,6 +978,16 @@ Current trigger: ambient_listener
 - If replying would create noise (side chat, casual banter, emoji-only, no real ask), output EXACTLY: [NO_REPLY]
 - For ambient listening (not mentioned), stay restrained. If uncertain, choose [NO_REPLY]."""
     
+    # ── deferred memory consolidation ──
+
+    async def _deferred_consolidation(self, session: "Session") -> None:
+        """Run memory consolidation in the background after response delivery."""
+        try:
+            await self._consolidate_memory(session)
+            self.sessions.save(session)
+        except Exception as e:
+            logger.error(f"Deferred memory consolidation failed: {e}", exc_info=True)
+
     # ── tool timing injection ──
 
     @staticmethod
@@ -597,13 +1080,21 @@ Current trigger: ambient_listener
             logger.error(f"TTS failed: {exc}")
             return ""
 
-    async def _process_message(self, msg: InboundMessage, session_key: str | None = None) -> OutboundMessage | None:
+    async def _process_message(
+        self,
+        msg: InboundMessage,
+        session_key: str | None = None,
+        buffer_key: str | None = None,
+    ) -> OutboundMessage | None:
         """
         Process a single inbound message.
         
         Args:
             msg: The inbound message to process.
             session_key: Override session key (used by process_direct).
+            buffer_key: Buffer key for mid-loop message injection.
+                When set, the agent loop drains buffered messages at
+                each step and injects them into the conversation.
         
         Returns:
             The response message, or None if no response needed.
@@ -738,6 +1229,26 @@ Current trigger: ambient_listener
                 self._bitget_account_tool.set_context(msg.principal_id, factory)
                 self._bitget_trade_tool.set_context(msg.principal_id, factory)
                 self._bitget_uta_tool.set_context(msg.principal_id, factory)
+
+            # Set admin + feedback tool contexts
+            if msg.principal_id and principal is not None:
+                user_role = getattr(principal, "role", "user") or "user"
+                self._admin_tool.set_context(
+                    principal_id=msg.principal_id,
+                    role=user_role,
+                    session_factory=factory,
+                    send_callback=self.bus.publish_outbound,
+                    chat_type=msg.chat_type or "",
+                    sender_id=msg.sender_id or "",
+                    channel=msg.channel or "",
+                )
+                self._feedback_tool.set_context(
+                    principal_id=msg.principal_id,
+                    role=user_role,
+                    session_key=msg.session_key,
+                    session_factory=factory,
+                    send_callback=self.bus.publish_outbound,
+                )
         except Exception as e:
             logger.warning(f"Identity/persona resolution failed: {e}")
 
@@ -777,25 +1288,135 @@ Current trigger: ambient_listener
                 persona["trading_style_text"] = group_persona.get("trading_style_text", "")
             self._persona_tool.set_group_context(group_persona_path)
 
-        # Consolidate memory with correct scope once identity/session metadata are ready.
-        if len(session.messages) > self.memory_window:
-            await self._consolidate_memory(session)
+        # Flag for deferred consolidation — run AFTER response so the LLM
+        # can start immediately (consolidation used to block 30-60s).
+        # Group chats get a much larger window so individual user context
+        # isn't evicted within hours in a busy room.
+        consolidation_threshold = self.memory_window * 3 if is_group else self.memory_window
+        _needs_consolidation = len(session.messages) > consolidation_threshold
+
+        # ── Events: check for active time-limited events / hidden personas ──
+        event_overlay: str | None = None
+        event_announcement: str | None = None
+        active_events = self.event_manager.get_active_events(
+            message=msg.content or "",
+            user_id=msg.principal_id or msg.sender_id,
+            chat_id=msg.chat_id or "",
+        )
+        if active_events:
+            event_overlay = self.event_manager.build_overlay_text(active_events)
+            event_announcement = self.event_manager.build_announcement(active_events)
+            card_theme = self.event_manager.get_card_theme(active_events)
+            if card_theme:
+                msg.metadata = msg.metadata or {}
+                msg.metadata["event_card_theme"] = card_theme
+            ev_names = [ae.config.name for ae in active_events]
+            logger.info(f"Active events: {ev_names}")
         
+        # ── Resolve admin flag and active model for this message ──
+        is_admin = False
+        if msg.principal_id:
+            try:
+                from getall.storage.database import get_session_factory as _gsf2
+                async with _gsf2()() as _db:
+                    from getall.storage.repository import IdentityRepo as _IR2
+                    _pr = await _IR2(_db).get_by_id(msg.principal_id)
+                    if _pr and getattr(_pr, "role", "user") == "admin":
+                        is_admin = True
+            except Exception:
+                pass
+
+        active_model = await self._get_active_model(msg.chat_type)
+
+        # ── Load system configs for prompt injection ──
+        system_configs: dict[str, str] = {}
+        try:
+            from getall.storage.database import get_session_factory as _gsf3
+            from getall.storage.repository import SystemConfigRepo as _SCR
+            async with _gsf3()() as _db3:
+                _all_cfg = await _SCR(_db3).list_all()
+                system_configs = {c.key: c.value for c in _all_cfg}
+        except Exception:
+            pass
+
         # Build initial messages (use get_history for LLM-formatted messages)
+        # Group chats get a wider history window so the agent sees more
+        # per-user context across many concurrent speakers.
+        history_window = self.memory_window * 2 if is_group else self.memory_window
+
         # For audio messages, exclude audio file paths from media sent to LLM.
         llm_media = [
             m for m in (msg.media or [])
             if not m.endswith((".ogg", ".opus", ".mp3", ".wav", ".m4a"))
         ] or None
+
+        # ── Smart media context: separate current vs historical ──────
+        _MAX_SESSION_MEDIA = 10
+        _MAX_HISTORICAL_INJECT = _MAX_SESSION_MEDIA
+        # Migrate legacy key
+        if "_recent_images" in session.metadata:
+            old = session.metadata.pop("_recent_images")
+            if old and "_session_media" not in session.metadata:
+                session.metadata["_session_media"] = old
+            session.metadata.pop("_recent_images_ts", None)
+
+        # ``llm_media`` = current turn's media (from msg.media).
+        # ``historical_media`` = recent session images always injected so
+        #   the agent can decide relevance itself (no keyword gating).
+        historical_media: list[str] | None = None
+
+        if llm_media:
+            # User sent new media → persist but do NOT mix in old images.
+            existing: list[str] = session.metadata.get("_session_media", [])
+            merged = list(dict.fromkeys(existing + llm_media))
+            merged = [p for p in merged if Path(p).is_file()]
+            session.metadata["_session_media"] = merged[-_MAX_SESSION_MEDIA:]
+            # historical_media stays None — focus on the new content.
+        elif session.metadata.get("_session_media"):
+            # No new media — always inject recent history so the agent
+            # can judge relevance from conversation context.
+            valid = [p for p in session.metadata["_session_media"] if Path(p).is_file()]
+            if valid:
+                historical_media = valid[-_MAX_HISTORICAL_INJECT:]
+                logger.debug(
+                    f"Injecting {len(historical_media)} historical media "
+                    f"for follow-up turn (of {len(valid)} stored)"
+                )
+            else:
+                session.metadata.pop("_session_media", None)
+
+        # Combine for vision-fallback check (both lists contribute).
+        _all_media = (llm_media or []) + (historical_media or [])
+
+        # ── Vision fallback: swap to a capable model when images are present ──
+        _vision_fallback_active = False
+        if _all_media and active_model:
+            from getall.config.schema import VISION_CAPABLE_MODELS, VISION_FALLBACK_MODEL
+            _has_images = any(
+                mimetypes.guess_type(p)[0] and mimetypes.guess_type(p)[0].startswith("image/")  # type: ignore[union-attr]
+                for p in _all_media if Path(p).is_file()
+            )
+            if _has_images and active_model not in VISION_CAPABLE_MODELS:
+                logger.info(
+                    f"Vision fallback: {active_model} → {VISION_FALLBACK_MODEL} "
+                    f"(model lacks vision, {len(_all_media)} media file(s))"
+                )
+                active_model = VISION_FALLBACK_MODEL
+                _vision_fallback_active = True
+
         messages = self.context.build_messages(
-            history=session.get_history(),
+            history=session.get_history(max_messages=history_window),
             current_message=self._format_current_user_content(msg),
             media=llm_media,
+            historical_media=historical_media,
             channel=msg.channel,
             chat_id=msg.chat_id,
             chat_type=msg.chat_type,
             persona=persona,
             memory_scope=memory_scope,
+            event_overlay=event_overlay,
+            is_admin=is_admin,
+            active_model=active_model,
         )
 
         # Inject voice capability section into system prompt (always).
@@ -821,9 +1442,37 @@ Current trigger: ambient_listener
             logger.debug(f"Injected {len(group_members)} group members into context: {names}")
         self._inject_group_reply_policy(msg, messages)
 
+        # ── Inject system configs (welcome_message_dm, etc.) ──
+        if system_configs and messages and messages[0].get("role") == "system":
+            cfg_section_parts: list[str] = []
+            welcome_dm = system_configs.get("welcome_message_dm")
+            if welcome_dm and not is_group:
+                cfg_section_parts.append(
+                    f"## Welcome Message (Private Chat)\n\n"
+                    f"When a new/unregistered user first messages you in private chat, "
+                    f"send this welcome message BEFORE anything else:\n\n"
+                    f"```\n{welcome_dm}\n```\n\n"
+                    f"Only send it once per user (check if they are already onboarded)."
+                )
+            # Generic system configs (exclude model:* and welcome_message_dm)
+            other_cfgs = {
+                k: v for k, v in system_configs.items()
+                if not k.startswith("model:") and k != "welcome_message_dm"
+            }
+            if other_cfgs:
+                lines = [f"- {k}: {v[:200]}" for k, v in other_cfgs.items()]
+                cfg_section_parts.append(
+                    f"## System Configs (admin-managed)\n\n" + "\n".join(lines)
+                )
+            if cfg_section_parts:
+                messages[0]["content"] += "\n\n" + "\n\n".join(cfg_section_parts)
+
         # ── Inject tool execution timing history for duration estimation ──
         self._inject_tool_timings(session, messages)
-        
+
+        # ── Context-window safety: trim history if it would exceed budget ──
+        messages = self._fit_messages_to_budget(messages, active_model)
+
         # ── Task-scoped heartbeat infrastructure ──
         # Background tasks that fire progress messages after a delay.
         # All auto-cancelled when processing completes.
@@ -868,18 +1517,37 @@ Current trigger: ambient_listener
         final_content = None
         tools_used: list[str] = []
         autofix_hints_sent = 0
+        _draft_response: str | None = None  # First text-only response held internally
         
         while iteration < self.max_iterations:
             iteration += 1
-            
-            # Call LLM
+
+            # ── Point A: drain buffered messages before LLM call ──
+            # Catches messages that arrived during previous iteration's
+            # tool execution (or between loop entry and first LLM call).
+            if buffer_key:
+                _pending = await self._drain_pending(buffer_key)
+                if _pending:
+                    llm_media = await self._inject_buffered_messages(
+                        _pending, messages, session, llm_media,
+                    )
+
+            # Call LLM (use dynamic model resolved from system_config)
             response = await self.provider.chat(
                 messages=messages,
                 tools=self.tools.get_definitions(),
-                model=self.model,
+                model=active_model,
                 max_tokens=self.max_tokens,
                 reasoning_effort=self.reasoning_effort,
             )
+            # Record token usage & cost (fire-and-forget)
+            asyncio.ensure_future(self._record_llm_usage(
+                response,
+                tenant_id=msg.tenant_id or "default",
+                principal_id=msg.principal_id or "",
+                session_key=session.key,
+                call_type="chat",
+            ))
             
             # LLM error → stop loop, use error message as final response
             if response.finish_reason == "error":
@@ -889,19 +1557,11 @@ Current trigger: ambient_listener
 
             # Handle tool calls
             if response.has_tool_calls:
-                # ── Intermediate text: send LLM's accompanying text to user ──
-                # When the LLM says something alongside tool calls (e.g.
-                # "让我来查一下…") we deliver it immediately so the user
-                # sees natural, human-like progress rather than silence.
-                intermediate_text = (response.content or "").strip()
-                if intermediate_text and not self._is_no_reply(intermediate_text):
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
-                        content=intermediate_text,
-                        metadata=msg.metadata or {},
-                    ))
-                    logger.info(f"Sent intermediate text: {intermediate_text[:80]}")
+                # NOTE: LLM text alongside tool calls is intentionally NOT
+                # auto-sent to the user.  It's usually a fragment ("让我调整
+                # 一下参数：") that reads awkwardly as a standalone message.
+                # The agent controls all user-facing communication itself via
+                # the message tool or task-scoped heartbeats.
 
                 # Add assistant message with tool calls
                 tool_call_dicts = [
@@ -954,8 +1614,89 @@ Current trigger: ambient_listener
                         messages.append({"role": "system", "content": hint})
                         autofix_hints_sent += 1
             else:
-                # No tool calls, we're done
-                final_content = response.content
+                # No tool calls — check if this is genuinely final.
+                content = (response.content or "").strip()
+
+                # ── Point B: drain buffer before any break/nudge ──
+                # Catches messages that arrived while the LLM was
+                # thinking.  If new messages exist, add the LLM's
+                # current response to context, inject the new user
+                # messages, and let the LLM respond again.
+                if buffer_key:
+                    _pending = await self._drain_pending(buffer_key)
+                    if _pending:
+                        messages = self.context.add_assistant_message(
+                            messages, content,
+                        )
+                        llm_media = await self._inject_buffered_messages(
+                            _pending, messages, session, llm_media,
+                        )
+                        # Reset draft state — the conversation has new
+                        # context so any previous draft is stale.
+                        _draft_response = None
+                        continue
+
+                # ── First text-only response with zero tools used ──
+                # The agent may have described plans instead of executing.
+                # Save the draft internally (NOT sent to user) and nudge
+                # the LLM to follow through.  All user communication goes
+                # through `message` tool or `reminders` heartbeat — the
+                # loop never auto-sends progress.
+                # Skip nudge when the user sent media (image/file/sticker):
+                # the model's first response is typically a direct analysis
+                # that IS the final answer — nudging just confuses it.
+                # Also skip nudge when the response is substantial (≥500
+                # chars): long, detailed responses are almost always the
+                # complete final answer — nudging causes the LLM to
+                # generate a short follow-up that replaces the real content.
+                has_media = bool(llm_media)
+                _is_substantial = bool(content and len(content) >= 500)
+                if (
+                    not tools_used
+                    and not _draft_response
+                    and not has_media
+                    and not _is_substantial
+                    and iteration < self.max_iterations
+                    and content
+                    and not self._is_no_reply(content)
+                ):
+                    _draft_response = content
+                    logger.info(
+                        f"Draft response saved (not sent), nudging agent: "
+                        f"{content[:60]}"
+                    )
+                    messages = self.context.add_assistant_message(
+                        messages, content,
+                    )
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "Your response above has NOT been sent to the user yet. "
+                            "Review it carefully:\n"
+                            "1. ACTION CHECK: Does your response claim any action "
+                            "was COMPLETED (model switched, data fetched, role "
+                            "changed, config set, message broadcast, etc.)? "
+                            "If YES but you did NOT call the corresponding tool, "
+                            "the action did NOT actually happen — you MUST call "
+                            "the tool NOW to execute it for real.\n"
+                            "2. If you need to fetch data or execute actions, use "
+                            "your tools NOW. To tell the user you're working on it, "
+                            "call `message(content=\"...\")`. For long tasks, also "
+                            "set `reminders(task_scoped=true, delay_seconds=N, "
+                            "message=\"...\")` as a heartbeat.\n"
+                            "3. If your response is already the complete final "
+                            "answer with no unexecuted action claims, respond "
+                            "with EXACTLY: [NO_REPLY] and it will be delivered as-is."
+                        ),
+                    })
+                    continue
+
+                # If the LLM returned [NO_REPLY] after a draft, deliver
+                # the draft as the final answer.
+                if _draft_response and self._is_no_reply(content):
+                    final_content = _draft_response
+                else:
+                    final_content = content
                 break
         
         if final_content is None:
@@ -996,13 +1737,37 @@ Current trigger: ambient_listener
         if isinstance(reminders_tool, ReminderTool):
             reminders_tool.clear_heartbeat_callbacks()
 
+        # ── Prepend event announcement (first-trigger only) ──
+        if event_announcement and final_content and not self._is_no_reply(final_content):
+            final_content = f"{event_announcement}\n\n---\n\n{final_content}"
+
         metadata = msg.metadata or {}
         strong_trigger = bool(metadata.get("bot_was_mentioned"))
+
         if is_group and strong_trigger and self._is_no_reply(final_content):
             logger.warning(
-                "Model returned NO_REPLY on strong group trigger; applying fallback reply"
+                "Model returned NO_REPLY on strong group trigger; forcing retry"
             )
-            final_content = "我在，收到。你继续说，我马上处理。"
+            messages.append({
+                "role": "system",
+                "content": (
+                    "You output [NO_REPLY], but the user explicitly @-mentioned you. "
+                    "You MUST reply. Give a brief, natural response to their message."
+                ),
+            })
+            try:
+                retry_resp = await self.provider.chat(
+                    messages=messages,
+                    tools=None,
+                    model=active_model,
+                    max_tokens=self.max_tokens,
+                    reasoning_effort=self.reasoning_effort,
+                )
+                retry_content = (retry_resp.content or "").strip()
+                if retry_content and not self._is_no_reply(retry_content):
+                    final_content = retry_content
+            except Exception as exc:
+                logger.error(f"Strong-trigger retry call failed: {exc}")
 
         suppress_group_reply = (
             is_group and (not strong_trigger) and self._is_no_reply(final_content)
@@ -1047,20 +1812,23 @@ Current trigger: ambient_listener
             )
         self.sessions.save(session)
 
+        # ── Deferred memory consolidation (runs after response, non-blocking) ──
+        if _needs_consolidation:
+            asyncio.create_task(self._deferred_consolidation(session))
+
         if suppress_group_reply:
             return None
 
-        # If the agent already sent messages via the message tool TO THE SAME CHAT,
-        # suppress the final outbound to avoid duplicate output.
-        # Messages sent to OTHER chats (e.g. a DM from a group context) don't suppress.
+        # Suppress final outbound ONLY when the agent explicitly marked a
+        # same-chat message as final=true (i.e. the full answer was already
+        # delivered via the message tool).  Progress messages (final=false,
+        # the default) never trigger suppression.
         if "message" in tools_used:
             msg_tool = self.tools.get("message")
-            sent_to_same = any(
-                cid == msg.chat_id
-                for cid in getattr(msg_tool, "sent_to_chat_ids", [])
-            )
-            if sent_to_same:
-                logger.debug("Suppressing final outbound — message tool already sent to this chat")
+            if isinstance(msg_tool, MessageTool) and msg_tool.final_delivered:
+                logger.debug(
+                    "Suppressing final outbound — agent marked message as final delivery"
+                )
                 return None
         
         # Extract generated image paths from tool results in the conversation
@@ -1083,19 +1851,6 @@ Current trigger: ambient_listener
         )
     
     _GENERATED_IMAGE_RE = re.compile(r"\[GENERATED_IMAGE:(.*?)\]")
-    _AUTOFIX_ERROR_PATTERNS = (
-        "command not found",
-        "not configured",
-        "no module named",
-        "module not found",
-        "tool '",
-        "missing required",
-        "permission denied",
-        "timed out",
-        "blocked by safety guard",
-        "outside allowed directory",
-        "error: script not found",
-    )
 
     @classmethod
     def _extract_generated_images(cls, messages: list[dict[str, Any]]) -> list[str]:
@@ -1111,23 +1866,26 @@ Current trigger: ambient_listener
                     paths.append(fpath)
         return paths
 
-    @classmethod
-    def _build_autofix_hint(cls, tool_name: str, result: str) -> str | None:
-        text = (result or "").lower()
+    @staticmethod
+    def _build_autofix_hint(tool_name: str, result: str) -> str | None:
+        """Nudge the agent to recover when a tool call errors.
+
+        No keyword matching — the agent reads the actual error and decides
+        how to fix it.  We only detect *that* an error occurred, never
+        *what kind*.
+        """
+        text = (result or "").strip()
         if not text:
             return None
-        if not (text.startswith("error") or "stderr:" in text):
-            return None
-        if not any(p in text for p in cls._AUTOFIX_ERROR_PATTERNS):
+        low = text.lower()
+        if not (low.startswith("error") or "stderr:" in low):
             return None
         return (
-            "Tool execution failed due to missing capability/setup. "
-            "Autonomously self-heal: (1) use web_search (prefer DuckDuckGo and reputable skill/tool registries "
-            "like clawhub.ai, smithery.ai, MCP registry, GitHub), "
-            "(2) install or create a reusable shared capability with workbench, "
-            "(3) retry the original task immediately, "
-            "(4) report to user in one concise natural-language line what was installed. "
-            "For privileged actions, ask for one explicit confirmation first."
+            "The tool call above returned an error. "
+            "Read the error carefully, diagnose the root cause, "
+            "and recover autonomously — try a different approach, "
+            "a different data source, or a different tool. "
+            "Do not give up after one failure."
         )
 
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
@@ -1172,6 +1930,9 @@ Current trigger: ambient_listener
             memory_scope=memory_scope,
         )
         
+        # Context-window safety
+        messages = self._fit_messages_to_budget(messages, active_model)
+
         # Agent loop (limited for announce handling)
         iteration = 0
         final_content = None
@@ -1186,6 +1947,13 @@ Current trigger: ambient_listener
                 max_tokens=self.max_tokens,
                 reasoning_effort=self.reasoning_effort,
             )
+            asyncio.ensure_future(self._record_llm_usage(
+                response,
+                tenant_id=msg.tenant_id or "default",
+                principal_id=msg.principal_id or "",
+                session_key=session_key,
+                call_type="chat",
+            ))
 
             if response.finish_reason == "error":
                 final_content = response.content
@@ -1286,17 +2054,68 @@ Current trigger: ambient_listener
         raise ValueError(f"Could not extract JSON from LLM response ({len(raw)} chars)")
 
     async def _consolidate_memory(self, session) -> None:
-        """Consolidate old messages into MEMORY.md + HISTORY.md, then trim session."""
+        """Consolidate old messages into MEMORY.md + HISTORY.md, then trim session.
+
+        Group chats get a larger keep_count and per-sender preservation
+        so individual user context isn't lost in high-traffic rooms.
+        """
         memory_scope = str(session.metadata.get("memory_scope") or "global")
         memory = MemoryStore(self.workspace, memory_scope)
-        keep_count = min(10, max(2, self.memory_window // 2))
-        old_messages = session.messages[:-keep_count]  # Everything except recent ones
+        is_group = memory_scope.startswith("group")
+
+        # ── Compute keep_count (group-aware) ──
+        if is_group:
+            # In a busy group, 10 messages evaporate in minutes.
+            # Keep more context so the agent can still see each user's recent activity.
+            keep_count = min(30, max(10, self.memory_window))
+        else:
+            keep_count = min(10, max(2, self.memory_window // 2))
+
+        # ── Per-sender preservation for group chats ──
+        # Guarantee at least the last 2 messages per active sender survive,
+        # even if they spoke earlier than the global keep_count window.
+        if is_group:
+            cutoff_idx = max(0, len(session.messages) - keep_count)
+            # Collect indices of each sender's most recent messages
+            sender_last: dict[str, list[int]] = {}
+            for idx, m in enumerate(session.messages):
+                if m.get("role") == "user":
+                    sender = str(
+                        m.get("sender_name") or m.get("sender_id") or ""
+                    ).strip()
+                    if sender:
+                        sender_last.setdefault(sender, []).append(idx)
+
+            preserve_indices: set[int] = set()
+            for indices in sender_last.values():
+                # Keep last 2 messages per sender
+                for i in indices[-2:]:
+                    if i < cutoff_idx:
+                        preserve_indices.add(i)
+
+            if preserve_indices:
+                # Merge preserved messages into the kept window
+                kept_msgs = [
+                    session.messages[i]
+                    for i in sorted(preserve_indices)
+                ] + session.messages[cutoff_idx:]
+                old_messages = [
+                    m for idx, m in enumerate(session.messages)
+                    if idx < cutoff_idx and idx not in preserve_indices
+                ]
+            else:
+                old_messages = session.messages[:-keep_count]
+                kept_msgs = session.messages[-keep_count:]
+        else:
+            old_messages = session.messages[:-keep_count]
+            kept_msgs = session.messages[-keep_count:]
+
         if not old_messages:
             return
         logger.info(
             "Memory consolidation started: "
             f"{len(session.messages)} messages, archiving {len(old_messages)}, "
-            f"keeping {keep_count}, scope={memory_scope}"
+            f"keeping {len(kept_msgs)}, scope={memory_scope}"
         )
 
         # Format messages for LLM (include tool names when available)
@@ -1319,11 +2138,23 @@ Current trigger: ambient_listener
         conversation = "\n".join(lines)
         current_memory = memory.read_long_term()
 
+        group_instruction = ""
+        if is_group:
+            group_instruction = (
+                "\n\nIMPORTANT — This is a GROUP chat consolidation. "
+                "Attribute actions/requests to specific users by name. "
+                "For each user who made a request or received a task, "
+                "record WHO asked, WHAT they asked, and the OUTCOME. "
+                "Example: 'Bill Lang asked for BTC/ETH pattern analysis; "
+                "agent delivered a 3-scenario prediction chart.' "
+                "Include any PENDING/UNFINISHED tasks with the user's name."
+            )
+
         prompt = f"""You are a memory consolidation agent. Process this conversation and return a JSON object with exactly two keys:
 
-1. "history_entry": A paragraph (2-5 sentences) summarizing the key events/decisions/topics. Start with a timestamp like [YYYY-MM-DD HH:MM]. Include enough detail to be useful when found by grep search later.
+1. "history_entry": A paragraph (2-5 sentences) summarizing the key events/decisions/topics. Start with a timestamp like [YYYY-MM-DD HH:MM]. Include enough detail to be useful when found by grep search later. Attribute actions to specific users by name when applicable.{group_instruction}
 
-2. "memory_update": The updated long-term memory content. Add any new facts: user location, preferences, personal info, habits, project context, technical decisions, tools/services used. If nothing new, return the existing content unchanged.
+2. "memory_update": The updated long-term memory content. Add any new facts: user location, preferences, personal info, habits, project context, technical decisions, tools/services used, pending tasks per user. If nothing new, return the existing content unchanged.
 
 ## Current Long-term Memory
 {current_memory or "(empty)"}
@@ -1341,6 +2172,11 @@ Respond with ONLY valid JSON, no markdown fences."""
                 ],
                 model=self.model,
             )
+            asyncio.ensure_future(self._record_llm_usage(
+                response,
+                session_key=session.key,
+                call_type="consolidation",
+            ))
             import json as _json
             text = (response.content or "").strip()
             result = self._extract_consolidation_json(text)
@@ -1351,13 +2187,16 @@ Respond with ONLY valid JSON, no markdown fences."""
                 if update != current_memory:
                     memory.write_long_term(update)
 
-            logger.info(f"Memory consolidation done, session trimmed to {len(session.messages)} → {keep_count}")
+            logger.info(
+                f"Memory consolidation done, session trimmed "
+                f"{len(session.messages)} → {len(kept_msgs)}"
+            )
         except Exception as e:
             logger.error(f"Memory consolidation failed: {e}")
         finally:
             # Always trim session to prevent unbounded growth,
             # even when consolidation fails.
-            session.messages = session.messages[-keep_count:]
+            session.messages = kept_msgs
             self.sessions.save(session)
 
     async def process_direct(
@@ -1406,5 +2245,8 @@ Respond with ONLY valid JSON, no markdown fences."""
             metadata=metadata or {},
         )
         
-        response = await self._process_message_with_lock(msg, session_key=session_key)
+        buffer_key = self._buffer_key_for_message(msg, session_key=session_key)
+        response = await self._process_message(
+            msg, session_key=session_key, buffer_key=buffer_key,
+        )
         return response.content if response else ""

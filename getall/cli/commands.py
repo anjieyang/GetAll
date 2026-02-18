@@ -188,20 +188,37 @@ def onboard():
 
 
 
+def _find_bundled_workspace() -> Path | None:
+    """Locate the bundled workspace/ directory shipped with the package.
+
+    Checks (in order):
+    1. Relative to source tree (development mode).
+    2. /app/workspace (Docker image).
+    """
+    candidates = [
+        Path(__file__).parent.parent.parent / "workspace",  # dev: repo root
+        Path("/app/workspace"),  # Docker
+    ]
+    for p in candidates:
+        if p.is_dir() and (p / "SOUL.md").exists():
+            return p
+    return None
+
+
 def _create_workspace_templates(workspace: Path):
     """Create default workspace bootstrap files.
 
     Files are only created if they don't already exist, so user
     customisations are never overwritten.
     """
-    # Load bundled templates from the package's workspace/ directory
-    _pkg_ws = Path(__file__).parent.parent.parent / "workspace"
+    _pkg_ws = _find_bundled_workspace()
 
     templates: dict[str, str] = {}
-    for name in ("AGENTS.md", "SOUL.md", "HEARTBEAT.md"):
-        src = _pkg_ws / name
-        if src.exists():
-            templates[name] = src.read_text(encoding="utf-8")
+    if _pkg_ws:
+        for name in ("AGENTS.md", "SOUL.md", "HEARTBEAT.md"):
+            src = _pkg_ws / name
+            if src.exists():
+                templates[name] = src.read_text(encoding="utf-8")
 
     # USER.md is a lightweight starter (not bundled)
     templates.setdefault("USER.md", """# User
@@ -221,6 +238,10 @@ Information about the user goes here.
             file_path.write_text(content)
             console.print(f"  [dim]Created {filename}[/dim]")
     
+    # Sync events directory (copy missing YAML files, never overwrite existing)
+    if _pkg_ws:
+        _sync_events(workspace, _pkg_ws)
+
     # Create memory directories
     memory_dir = workspace / "memory"
     memory_dir.mkdir(exist_ok=True)
@@ -240,6 +261,20 @@ Information about the user goes here.
     # Create skills directory for custom user skills
     skills_dir = workspace / "skills"
     skills_dir.mkdir(exist_ok=True)
+
+
+def _sync_events(workspace: Path, bundled_ws: Path) -> None:
+    """Copy bundled event YAML files to workspace if they don't exist."""
+    src_events = bundled_ws / "events"
+    if not src_events.is_dir():
+        return
+    dst_events = workspace / "events"
+    dst_events.mkdir(exist_ok=True)
+    for src_file in src_events.glob("*.yaml"):
+        dst_file = dst_events / src_file.name
+        if not dst_file.exists():
+            dst_file.write_text(src_file.read_text(encoding="utf-8"), encoding="utf-8")
+            console.print(f"  [dim]Created events/{src_file.name}[/dim]")
 
 
 def _make_provider(config):
@@ -288,8 +323,22 @@ def gateway(
     console.print(f"{__logo__} Starting GetAll gateway on port {port}...")
     
     config = load_config()
+
+    # Ensure default workspace files exist (SOUL.md, AGENTS.md, events/, etc.)
+    _create_workspace_templates(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
+
+    # Register per-model credentials so runtime model switching works.
+    # Each allowed model resolves to its own provider's api_key + api_base.
+    from getall.config.schema import ALLOWED_MODELS
+    for model_name in ALLOWED_MODELS:
+        p_cfg = config.get_provider(model_name)
+        p_base = config.get_api_base(model_name)
+        if p_cfg and p_cfg.api_key:
+            provider.register_model_credentials(model_name, p_cfg.api_key, p_base)
+            logger.info(f"Model credentials registered: {model_name}")
+
     session_manager = SessionManager(config.workspace_path)
     
     # Create cron service first (callback set after agent creation)
@@ -339,35 +388,49 @@ def gateway(
             return f"[you](tg://user?id={raw})"
         return ""
 
-    def _feishu_group_mention(sender_id: str) -> str:
-        """Build a Feishu/Lark mention token from stored sender_id(open_id)."""
+    def _feishu_sender_open_id(sender_id: str) -> str:
+        """Extract Feishu/Lark open_id from stored sender_id."""
         raw = (sender_id or "").strip()
         if not raw:
             return ""
         if "|" in raw:
             raw = raw.split("|", 1)[0].strip()
-        if not raw:
-            return ""
-        # Feishu card markdown @mention tag.
-        return f"<at id={raw}></at>"
+        return raw
 
     def _render_group_targeted_content(job: CronJob, content: str) -> str:
         """Prefix reminder output with owner mention in Telegram group chats."""
         channel = (job.payload.channel or "").strip().lower()
-        if channel not in {"telegram", "feishu", "lark"}:
+        if channel != "telegram":
             return content
         if (job.payload.chat_type or "").strip().lower() != "group":
             return content
-        if channel == "telegram":
-            mention = _telegram_group_mention(job.payload.sender_id)
-        else:
-            mention = _feishu_group_mention(job.payload.sender_id)
+        mention = _telegram_group_mention(job.payload.sender_id)
         if not mention:
             return content
         stripped = (content or "").lstrip()
         if stripped.startswith(mention):
             return content
         return f"{mention} {content}"
+
+    def _build_group_targeted_metadata(job: CronJob) -> dict[str, str]:
+        """Build channel-native group targeting metadata for outbound delivery.
+
+        Feishu/Lark mentions are handled in channel layer to avoid breaking
+        markdown heading detection (e.g. '##' must stay at column 0).
+        """
+        channel = (job.payload.channel or "").strip().lower()
+        if channel not in {"feishu", "lark"}:
+            return {}
+        if (job.payload.chat_type or "").strip().lower() != "group":
+            return {}
+        sender_open_id = _feishu_sender_open_id(job.payload.sender_id)
+        if not sender_open_id:
+            return {}
+        return {
+            "sender_open_id": sender_open_id,
+            "source": "cron",
+            "cron_job_id": job.id,
+        }
 
     def _build_cron_agent_prompt(job: CronJob, task_prompt: str) -> str:
         """Wrap cron-triggered task with anti-recursion guardrails."""
@@ -377,7 +440,10 @@ def gateway(
             "CRITICAL RULES:\n"
             "1) The schedule already exists. Do NOT create/update/list/delete reminders now.\n"
             "2) Execute only the task content below.\n"
-            "3) Use data/trading/tools as needed and return this trigger's result.\n\n"
+            "3) Use data/trading/tools as needed and return this trigger's result.\n"
+            "4) Do NOT send any acknowledgment or confirmation message (e.g. '收到', '好的', '马上处理') "
+            "before executing the task. No one sent you this message — it is a scheduled trigger. "
+            "Go straight to work and only send the final result.\n\n"
             f"Task:\n{task_prompt}"
         )
     
@@ -406,10 +472,12 @@ def gateway(
             content = _render_group_targeted_content(job, content)
             if job.payload.deliver and job.payload.to:
                 from getall.bus.events import OutboundMessage
+                outbound_metadata = _build_group_targeted_metadata(job)
                 await bus.publish_outbound(OutboundMessage(
                     channel=job.payload.channel or "cli",
                     chat_id=job.payload.to,
                     content=content,
+                    metadata=outbound_metadata,
                 ))
             return content
 
@@ -429,9 +497,12 @@ def gateway(
         # Older reminder records may miss identity fields. Never fan them out
         # globally when they already carry an explicit delivery target.
         if not job.payload.principal_id and job.payload.channel and job.payload.to:
+            # Use the target chat's session so cron output appears in the
+            # conversation context when the user replies in the same chat.
+            target_session_key = f"{job.payload.channel}:{job.payload.to}"
             response = await agent.process_direct(
                 reminder_prompt,
-                session_key=f"cron:{job.id}",
+                session_key=target_session_key,
                 channel=job.payload.channel,
                 chat_id=job.payload.to,
                 sender_id=job.payload.sender_id or "user",
@@ -442,10 +513,12 @@ def gateway(
             response = _render_group_targeted_content(job, response or "")
             if job.payload.deliver and job.payload.to:
                 from getall.bus.events import OutboundMessage
+                outbound_metadata = _build_group_targeted_metadata(job)
                 await bus.publish_outbound(OutboundMessage(
                     channel=job.payload.channel or "cli",
                     chat_id=job.payload.to,
-                    content=response or ""
+                    content=response or "",
+                    metadata=outbound_metadata,
                 ))
             return response
 
@@ -453,11 +526,16 @@ def gateway(
 
         # ── User-scoped job (has principal_id) ──
         if job.payload.principal_id:
+            # Use the target chat's session so cron output appears in the
+            # conversation context when the user replies in the same chat.
+            cron_channel = job.payload.channel or "cli"
+            cron_chat_id = job.payload.to or "direct"
+            target_session_key = f"{cron_channel}:{cron_chat_id}"
             response = await agent.process_direct(
                 cron_agent_prompt,
-                session_key=f"cron:{job.id}",
-                channel=job.payload.channel or "cli",
-                chat_id=job.payload.to or "direct",
+                session_key=target_session_key,
+                channel=cron_channel,
+                chat_id=cron_chat_id,
                 sender_id=job.payload.sender_id or "user",
                 tenant_id=job.payload.tenant_id or "default",
                 principal_id=job.payload.principal_id,
@@ -474,10 +552,12 @@ def gateway(
             response = _render_group_targeted_content(job, response or "")
             if job.payload.deliver and job.payload.to:
                 from getall.bus.events import OutboundMessage
+                outbound_metadata = _build_group_targeted_metadata(job)
                 await bus.publish_outbound(OutboundMessage(
                     channel=job.payload.channel or "cli",
                     chat_id=job.payload.to,
-                    content=response or ""
+                    content=response or "",
+                    metadata=outbound_metadata,
                 ))
             return response
 
@@ -500,9 +580,12 @@ def gateway(
 
         last_response: str | None = None
         for principal_id, route in routes.items():
+            # Use the target chat's session so cron output appears in the
+            # conversation context when the user replies in the same chat.
+            target_session_key = f"{route.channel}:{route.chat_id}"
             response = await agent.process_direct(
                 cron_agent_prompt,
-                session_key=f"cron:{job.id}:{principal_id}",
+                session_key=target_session_key,
                 channel=route.channel,
                 chat_id=route.chat_id,
                 sender_id=f"cron:{job.id}",
@@ -539,6 +622,35 @@ def gateway(
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
     else:
         console.print("[yellow]Warning: No channels enabled[/yellow]")
+
+    # Wire direct send for MessageTool so it gets delivery errors
+    # (the queue-based bus.publish_outbound is fire-and-forget)
+    from getall.bus.events import OutboundMessage as _OM
+    from getall.agent.tools.message import MessageTool as _MT
+    _msg_tool = agent.tools.get("message")
+    if isinstance(_msg_tool, _MT):
+        async def _direct_send(msg: _OM) -> None:
+            ch = channels.get_channel(msg.channel)
+            if not ch:
+                raise ValueError(f"Channel '{msg.channel}' not available")
+            await ch.send(msg)
+        _msg_tool.set_send_callback(_direct_send)
+
+        # Wire recipient resolver: resolve display names → platform IDs
+        # using feishu member cache (search all known group caches)
+        def _resolve_recipient(channel: str, name_or_id: str) -> str | None:
+            ch = channels.get_channel(channel)
+            if ch is None:
+                return None
+            from getall.channels.feishu import FeishuChannel as _FC
+            if isinstance(ch, _FC):
+                # Search all cached group member lists for this name
+                for chat_id in list(ch._members._by_name.keys()):
+                    resolved = ch._members.resolve_name(chat_id, name_or_id)
+                    if resolved:
+                        return resolved
+            return None
+        _msg_tool.set_recipient_resolver(_resolve_recipient)
     
     cron_status = cron.status()
     if cron_status["jobs"] > 0:
@@ -581,6 +693,28 @@ def gateway(
         except Exception as e:
             logger.warning(f"Database auto-migrate skipped: {e}")
 
+        # Bootstrap admin principals from GETALL_ADMIN_IFTS env var
+        admin_ifts: list[str] = getattr(config, "_admin_ifts", [])
+        if admin_ifts:
+            try:
+                from getall.storage.database import get_session_factory
+                from getall.storage.repository import IdentityRepo
+                factory = get_session_factory()
+                async with factory() as db_session:
+                    repo = IdentityRepo(db_session)
+                    for ift in admin_ifts:
+                        p = await repo.get_by_ift(ift)
+                        if p and p.role != "admin":
+                            await repo.set_role(p.id, "admin")
+                            logger.info(f"Admin bootstrapped: {p.pet_name or p.ift}")
+                        elif p:
+                            logger.debug(f"Already admin: {p.pet_name or p.ift}")
+                        else:
+                            logger.info(f"Admin IFT not found (user not yet registered): {ift}")
+                    await db_session.commit()
+            except Exception as e:
+                logger.warning(f"Admin bootstrap failed: {e}")
+
         tasks = [agent.run(), channels.start_all()]
 
         # Start HTTP server when Lark webhook is enabled
@@ -588,16 +722,34 @@ def gateway(
             tasks.append(_run_http_server(port))
             console.print(f"[green]✓[/green] HTTP server on :{port} (Lark webhook)")
 
-        try:
-            await cron.start()
-            await heartbeat.start()
-            await asyncio.gather(*tasks)
-        except KeyboardInterrupt:
+        _shutdown_done = False
+
+        async def _graceful_shutdown() -> None:
+            """Send lifecycle notifications and tear down services."""
+            nonlocal _shutdown_done
+            if _shutdown_done:
+                return
+            _shutdown_done = True
             console.print("\nShutting down...")
             heartbeat.stop()
             cron.stop()
             agent.stop()
             await channels.stop_all()
+
+        # Register SIGTERM handler for Docker / systemd graceful stop
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(
+                sig,
+                lambda: asyncio.ensure_future(_graceful_shutdown()),
+            )
+
+        try:
+            await cron.start()
+            await heartbeat.start()
+            await asyncio.gather(*tasks)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            await _graceful_shutdown()
     
     asyncio.run(run())
 

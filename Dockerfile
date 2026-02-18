@@ -32,12 +32,18 @@ RUN mkdir -p getall bridge && touch getall/__init__.py && \
 # Copy the full source and install
 COPY getall/ getall/
 COPY bridge/ bridge/
+COPY workspace/ workspace/
 RUN uv pip install --system --no-cache .
 
 # Build the WhatsApp bridge
 WORKDIR /app/bridge
 RUN npm install && npm run build
 WORKDIR /app
+
+# Install Playwright + Chromium for headless chart rendering
+RUN pip install --no-cache-dir playwright && \
+    playwright install --with-deps chromium && \
+    rm -rf /tmp/*
 
 # Clear proxy for runtime
 ENV http_proxy="" https_proxy=""

@@ -81,12 +81,25 @@ class BacktestTool(Tool):
                 },
                 "exchange": {
                     "type": "string",
-                    "description": "Exchange for OHLCV data ('binance' or 'bitget')",
-                    "enum": ["binance", "bitget"],
+                    "description": (
+                        "Exchange for OHLCV data. Options: binance (widest coverage, default), "
+                        "bitget, okx, bybit, coinbase, kraken, kucoin. "
+                        "If result contains failed_symbols, retry those on another exchange."
+                    ),
+                    "enum": ["binance", "bitget", "okx", "bybit", "coinbase", "kraken", "kucoin"],
                 },
                 "starting_balance": {
                     "type": "number",
                     "description": "Initial cash. Default: 100000",
+                },
+                "ohlcv_json": {
+                    "type": "string",
+                    "description": (
+                        "For action='run': pre-fetched OHLCV data as JSON string. "
+                        "Use when data comes from coingecko or yfinance_ohlcv tools. "
+                        "Format: {\"SYMBOL\": [{\"timestamp\":ms,\"open\":...,\"high\":...,\"low\":...,\"close\":...,\"volume\":...}, ...]} "
+                        "When provided, skips exchange data fetching entirely."
+                    ),
                 },
                 "metrics_json": {
                     "type": "string",
@@ -131,25 +144,32 @@ class BacktestTool(Tool):
         starting_balance = kwargs.get("starting_balance", 100_000)
         exchange_name = kwargs.get("exchange")
 
-        # Resolve exchange adapter
-        ex = await self._resolve_exchange(exchange_name)
-        if ex is None:
-            return json.dumps({
-                "error": "No exchange available. Configure exchanges.yaml or pass exchange='binance'."
-            })
+        # ── Option A: Agent supplies pre-fetched OHLCV (from coingecko/yfinance) ──
+        ohlcv_json_str = kwargs.get("ohlcv_json")
+        if ohlcv_json_str:
+            ohlcv_data, parse_err = self._parse_external_ohlcv(ohlcv_json_str)
+            if parse_err:
+                return json.dumps({"error": parse_err})
+            failed_symbols: list[str] = []
+        else:
+            # ── Option B: Fetch from exchange via ccxt ──
+            ex = await self._resolve_exchange(exchange_name)
+            if ex is None:
+                return json.dumps({
+                    "error": "No exchange available. Configure exchanges.yaml or pass exchange='binance'."
+                })
 
-        # Fetch OHLCV (skip symbols that fail, don't abort the whole batch)
-        ohlcv_data: dict[str, pd.DataFrame] = {}
-        failed_symbols: list[str] = []
-        timeframe = config.get("timeframe", "4h")
-        for symbol in symbols:
-            normalized = self._normalize_symbol(symbol)
-            df, err = await self._load_ohlcv(ex, normalized, timeframe, period)
-            if err or df.empty:
-                logger.warning(f"Skipping {symbol} ({normalized}): {err or 'empty data'}")
-                failed_symbols.append(symbol)
-                continue
-            ohlcv_data[normalized] = df
+            ohlcv_data: dict[str, pd.DataFrame] = {}
+            failed_symbols: list[str] = []
+            timeframe = config.get("timeframe", "4h")
+            for symbol in symbols:
+                normalized = self._normalize_symbol(symbol)
+                df, err = await self._load_ohlcv(ex, normalized, timeframe, period)
+                if err or df.empty:
+                    logger.warning(f"Skipping {symbol} ({normalized}): {err or 'empty data'}")
+                    failed_symbols.append(symbol)
+                    continue
+                ohlcv_data[normalized] = df
 
         if not ohlcv_data:
             return json.dumps({
@@ -167,7 +187,7 @@ class BacktestTool(Tool):
             metrics["loaded_symbols"] = list(ohlcv_data.keys())
 
         # Generate chart by default (uses internal _equity_curve / _benchmark_curve)
-        chart_path = generate_chart(
+        chart_path = await generate_chart(
             metrics,
             save_dir=self._chart_dir(),
         )
@@ -199,7 +219,7 @@ class BacktestTool(Tool):
         except json.JSONDecodeError as e:
             return json.dumps({"error": f"Invalid metrics JSON: {e}"})
 
-        chart_path = generate_chart(metrics, save_dir=self._chart_dir())
+        chart_path = await generate_chart(metrics, save_dir=self._chart_dir())
         if chart_path:
             return json.dumps({"chart_path": chart_path})
         return json.dumps({"error": "No equity curve data to chart"})
@@ -238,10 +258,47 @@ class BacktestTool(Tool):
             logger.warning(f"Failed to create public exchange '{name}': {e}")
             return None
 
+    _VALID_EXCHANGES = {"binance", "bitget", "okx", "bybit", "coinbase", "kraken", "kucoin"}
+
     def _default_exchange_name(self) -> str:
         cfg = getattr(self.hub, "_config", None)
         name = str(getattr(cfg, "default_exchange", "") or "").strip().lower()
-        return name if name in {"binance", "bitget"} else "binance"
+        return name if name in self._VALID_EXCHANGES else "binance"
+
+    @staticmethod
+    def _parse_external_ohlcv(raw: str) -> tuple[dict[str, pd.DataFrame], str | None]:
+        """Parse agent-supplied OHLCV JSON into {symbol: DataFrame}.
+
+        Accepts two formats:
+        1. Direct from coingecko/yfinance tool: {"ohlcv": [{...}, ...], "symbol": "X"}
+        2. Multi-symbol dict: {"SYM1": [{...}], "SYM2": [{...}]}
+        """
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            return {}, f"Invalid ohlcv_json: {e}"
+
+        result: dict[str, pd.DataFrame] = {}
+
+        # Format 1: single-symbol output from coingecko/yfinance tools
+        if "ohlcv" in data and isinstance(data["ohlcv"], list):
+            symbol = data.get("symbol") or data.get("coin_id") or "EXTERNAL"
+            rows = data["ohlcv"]
+            df = ccxt_to_dataframe(rows, symbol)
+            if not df.empty:
+                result[symbol] = df
+            return result, None if result else f"ohlcv array was empty for {symbol}"
+
+        # Format 2: multi-symbol dict {"BTC/USDT": [...], ...}
+        for symbol, rows in data.items():
+            if isinstance(rows, list) and rows:
+                df = ccxt_to_dataframe(rows, symbol)
+                if not df.empty:
+                    result[symbol] = df
+
+        if not result:
+            return {}, "No valid OHLCV data found in ohlcv_json"
+        return result, None
 
     @staticmethod
     def _normalize_symbol(symbol: str) -> str:

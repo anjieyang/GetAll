@@ -15,7 +15,6 @@ _BATCH_DIMENSIONS = {
     "oi": "get_exchange_oi",                  # 持仓量 (各交易所实时快照)
     "funding": "get_funding_rate_exchange",    # 资金费率 (交易所列表)
     "long_short": "get_long_short_ratio",     # 全网多空比 (Binance h1 history)
-    "net_position": "get_net_position_history",  # 净多头/净空头头寸变化 (h1 history)
     "taker": "get_taker_buy_sell",            # 主动买卖比
     "cvd": "get_cvd",                         # 累计成交量差
     "liquidations": "get_liquidations",       # 清算数据
@@ -42,16 +41,26 @@ class MarketDataTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Get crypto market data: prices, derivatives data "
-            "(OI, funding rates, long/short ratios, CVD, liquidations, "
-            "whale transfers, orderbook), and market indicators.\n"
-            "Supports batch operations:\n"
-            "- batch_scan: scan multiple coins × multiple dimensions in one call "
-            "(ideal for anomaly detection cron)\n"
-            "- multi_price: get prices for multiple symbols at once\n"
-            "- binance_symbols: fetch Binance symbols universe (via Coinglass)\n"
-            "- batch_klines: fetch klines for multiple symbols (via ExchangeAdapter)\n"
-            "- volatility_rank: 24h gainers/losers ranking (universe + klines)"
+            "Get crypto market data: prices, derivatives, options, spot, on-chain, "
+            "and market indicators.\n"
+            "Batch operations:\n"
+            "- batch_scan: multi-coin × multi-dimension scan\n"
+            "- multi_price / batch_klines / volatility_rank\n"
+            "Global (no symbol needed):\n"
+            "- token_unlocks: upcoming token unlock schedules\n"
+            "- liquidation_coin_list: all coins liquidation ranking (24h/12h/4h/1h)\n"
+            "- ahr999: Bitcoin AHR999 valuation index\n"
+            "- top_funding_rates / top_oi / top_liquidations\n"
+            "Per-coin:\n"
+            "- price, klines, ticker_24h, open_interest, oi_history\n"
+            "- funding_rate, funding_rate_exchange, long_short_ratio\n"
+            "- taker_buy_sell, cvd, coin_flow, spot_netflow\n"
+            "- liquidations, large_orderbook, whale_transfers\n"
+            "- basis_history: futures-spot basis (arbitrage analysis)\n"
+            "- spot_pairs: spot pairs data by exchange\n"
+            "- option_info: options OI & volume overview\n"
+            "- option_max_pain: options max pain by expiry\n"
+            "- fear_greed: crypto fear & greed index"
         )
 
     @property
@@ -66,26 +75,31 @@ class MarketDataTool(Tool):
                         # ── 批量操作 ──
                         "batch_scan", "multi_price", "binance_symbols", "batch_klines",
                         "volatility_rank",
-                        # ── 全市场排行 ──
+                        # ── 全市场 (no symbol needed) ──
                         "top_funding_rates", "top_oi", "top_liquidations",
-                        # ── 单币操作 ──
-                        # 基础行情 (ccxt / Coinglass)
-                        "price", "klines", "ticker_24h", "coin_change",
-                        # 持仓量 (Coinglass OI)
+                        "token_unlocks", "liquidation_coin_list", "ahr999",
+                        # ── 单币: 行情 ──
+                        "price", "klines", "ticker_24h",
+                        # ── 单币: 持仓量 ──
                         "open_interest", "oi_history",
-                        # 资金费率 (Coinglass Funding)
+                        # ── 单币: 资金费率 ──
                         "funding_rate", "funding_rate_exchange",
-                        # 多空比 (Coinglass Long/Short)
-                        "long_short_ratio", "top_long_short_account",
-                        "top_long_short_position", "net_long_short", "net_position",
-                        # 主动买卖 / CVD (Coinglass Taker)
+                        # ── 单币: 多空比 ──
+                        "long_short_ratio",
+                        # ── 单币: 主动买卖 / CVD ──
                         "taker_buy_sell", "taker_buy_sell_history", "cvd",
                         "coin_flow", "spot_netflow",
-                        # 清算 & 大单 (Coinglass)
-                        "liquidations", "liquidation_orders", "large_orderbook",
-                        # 链上数据 (Coinglass On-chain)
+                        # ── 单币: 清算 & 大单 ──
+                        "liquidations", "large_orderbook",
+                        # ── 单币: 期现差价 ──
+                        "basis_history",
+                        # ── 单币: 现货 ──
+                        "spot_pairs",
+                        # ── 单币: 期权 ──
+                        "option_info", "option_max_pain",
+                        # ── 单币: 链上 ──
                         "whale_transfers",
-                        # 市场指标 (Coinglass)
+                        # ── 单币: 指标 ──
                         "fear_greed",
                     ],
                 },
@@ -109,7 +123,7 @@ class MarketDataTool(Tool):
                     "type": "string",
                     "description": (
                         "Comma-separated data dimensions for batch_scan. "
-                        "Available: oi,funding,long_short,net_position,taker,cvd,"
+                        "Available: oi,funding,long_short,taker,cvd,"
                         "liquidations,whale,coin_flow,spot_netflow,large_orderbook. "
                         "Default: oi,funding,long_short,taker,cvd,liquidations"
                     ),
@@ -248,6 +262,14 @@ class MarketDataTool(Tool):
             if action == "top_liquidations":
                 return await self._top_liquidations(timeframe=timeframe or "1h", limit=limit or 10)
 
+            # ── 全市场数据 (no symbol needed) ──
+            if action == "token_unlocks":
+                return await self._token_unlocks(limit=limit)
+            if action == "liquidation_coin_list":
+                return await self._liquidation_coin_list(limit=limit)
+            if action == "ahr999":
+                return await self._ahr999()
+
             # ── 单币操作: 需要 symbol ──
             if not symbol:
                 return "Error: 'symbol' is required for this action."
@@ -271,7 +293,6 @@ class MarketDataTool(Tool):
             "price": self._price,
             "klines": self._klines,
             "ticker_24h": self._ticker_24h,
-            "coin_change": self._coin_change,
             # 持仓量
             "open_interest": self._open_interest,
             "oi_history": self._oi_history,
@@ -280,10 +301,6 @@ class MarketDataTool(Tool):
             "funding_rate_exchange": self._funding_rate_exchange,
             # 多空比
             "long_short_ratio": self._long_short_ratio,
-            "top_long_short_account": self._top_long_short_account,
-            "top_long_short_position": self._top_long_short_position,
-            "net_long_short": self._net_long_short,
-            "net_position": self._net_position,
             # 主动买卖 / CVD
             "taker_buy_sell": self._taker_buy_sell,
             "taker_buy_sell_history": self._taker_buy_sell_history,
@@ -292,8 +309,14 @@ class MarketDataTool(Tool):
             "spot_netflow": self._spot_netflow,
             # 清算 & 大单
             "liquidations": self._liquidations,
-            "liquidation_orders": self._liquidation_orders,
             "large_orderbook": self._large_orderbook,
+            # 期现差价
+            "basis_history": self._basis_history,
+            # 现货
+            "spot_pairs": self._spot_pairs,
+            # 期权
+            "option_info": self._option_info,
+            "option_max_pain": self._option_max_pain,
             # 链上
             "whale_transfers": self._whale_transfers,
             # 指标
@@ -333,7 +356,7 @@ class MarketDataTool(Tool):
                 # 根据方法签名传参
                 if dim in ("whale",):
                     coro = method(symbol=sym, limit=5)
-                elif dim in ("long_short", "cvd", "net_position", "taker"):
+                elif dim in ("long_short", "cvd", "taker"):
                     coro = method(symbol=sym, interval="h1")
                 else:
                     coro = method(symbol=sym)
@@ -1051,28 +1074,6 @@ class MarketDataTool(Tool):
                     )
                 return str(data)[:120]
 
-            elif dim == "net_position":
-                # 净多头/净空头头寸 history: 对比最新 vs 1h/4h 前
-                if isinstance(data, list) and len(data) >= 2:
-                    def _get_np(item: dict) -> float | None:
-                        v = item.get("netPosition", item.get("netLong", item.get("value")))
-                        return float(v) if v is not None else None
-
-                    now = _get_np(data[-1]) if isinstance(data[-1], dict) else None
-                    h1_ago = _get_np(data[-2]) if len(data) >= 2 and isinstance(data[-2], dict) else None
-                    h4_ago = _get_np(data[-5]) if len(data) >= 5 and isinstance(data[-5], dict) else None
-
-                    direction = "净多" if (now or 0) > 0 else "净空"
-                    parts = [f"{direction}={now}"]
-                    if now is not None and h1_ago is not None and h1_ago != 0:
-                        pct = (now - h1_ago) / abs(h1_ago) * 100
-                        parts.append(f"1h_chg={pct:+.2f}%")
-                    if now is not None and h4_ago is not None and h4_ago != 0:
-                        pct = (now - h4_ago) / abs(h4_ago) * 100
-                        parts.append(f"4h_chg={pct:+.2f}%")
-                    return " | ".join(parts)
-                return str(data)[:120]
-
             elif dim == "coin_flow":
                 if isinstance(data, dict):
                     return f"netFlow={data.get('netFlow', data.get('inflowVolUsd', 'N/A'))}"
@@ -1164,11 +1165,6 @@ class MarketDataTool(Tool):
             f"  24h Volume (quote): {t.get('quote_volume', 'N/A')}"
         )
 
-    async def _coin_change(self, symbol: str, **_) -> str:
-        """获取币种涨跌幅（Coinglass）"""
-        data = await self.hub.coinglass.get_coin_change(symbol=self._base_symbol(symbol))
-        return self._format_response(f"{symbol} Price Change", data)
-
     # ──────────────────────────────────────────────
     # 持仓量 (Open Interest)
     # ──────────────────────────────────────────────
@@ -1213,38 +1209,6 @@ class MarketDataTool(Tool):
             symbol=self._base_symbol(symbol), interval=tf
         )
         return self._format_response(f"{symbol} Long/Short Ratio ({tf})", data)
-
-    async def _top_long_short_account(self, symbol: str, timeframe: str | None, **_) -> str:
-        """获取大户账户多空比"""
-        tf = timeframe or "1h"
-        data = await self.hub.coinglass.get_top_long_short_account(
-            symbol=self._base_symbol(symbol), interval=tf
-        )
-        return self._format_response(f"{symbol} Top Trader Account L/S ({tf})", data)
-
-    async def _top_long_short_position(self, symbol: str, timeframe: str | None, **_) -> str:
-        """获取大户持仓多空比"""
-        tf = timeframe or "1h"
-        data = await self.hub.coinglass.get_top_long_short_position(
-            symbol=self._base_symbol(symbol), interval=tf
-        )
-        return self._format_response(f"{symbol} Top Trader Position L/S ({tf})", data)
-
-    async def _net_long_short(self, symbol: str, timeframe: str | None, **_) -> str:
-        """获取净多空头寸 (账户比 chart)"""
-        tf = timeframe or "1h"
-        data = await self.hub.coinglass.get_net_long_short(
-            symbol=self._base_symbol(symbol)
-        )
-        return self._format_response(f"{symbol} Net Long/Short", data)
-
-    async def _net_position(self, symbol: str, timeframe: str | None, **_) -> str:
-        """获取净多头/净空头头寸变化 (真实头寸)"""
-        tf = timeframe or "h1"
-        data = await self.hub.coinglass.get_net_position_history(
-            symbol=self._base_symbol(symbol), interval=tf
-        )
-        return self._format_response(f"{symbol} Net Position History ({tf})", data)
 
     # ──────────────────────────────────────────────
     # 主动买卖 / CVD (Taker Buy/Sell)
@@ -1294,17 +1258,49 @@ class MarketDataTool(Tool):
         data = await self.hub.coinglass.get_liquidations(symbol=self._base_symbol(symbol))
         return self._format_response(f"{symbol} Liquidations", data)
 
-    async def _liquidation_orders(self, symbol: str, limit: int | None, **_) -> str:
-        """获取清算订单明细"""
-        data = await self.hub.coinglass.get_liquidation_orders(
-            symbol=self._base_symbol(symbol), limit=limit or 20
-        )
-        return self._format_response(f"{symbol} Liquidation Orders", data)
-
     async def _large_orderbook(self, symbol: str, **_) -> str:
         """获取大单挂单数据"""
         data = await self.hub.coinglass.get_large_orderbook(symbol=self._base_symbol(symbol))
         return self._format_response(f"{symbol} Large Orderbook", data)
+
+    # ──────────────────────────────────────────────
+    # 期现差价 (Basis)
+    # ──────────────────────────────────────────────
+
+    async def _basis_history(self, symbol: str, exchange: str | None = None, timeframe: str | None = None, **_) -> str:
+        """获取期现差价历史"""
+        data = await self.hub.coinglass.get_basis_history(
+            symbol=self._base_symbol(symbol),
+            exchange=exchange or "Binance",
+            interval=timeframe or "h1",
+        )
+        return self._format_response(f"{symbol} Futures Basis History", data)
+
+    # ──────────────────────────────────────────────
+    # 现货 (Spot)
+    # ──────────────────────────────────────────────
+
+    async def _spot_pairs(self, symbol: str, **_) -> str:
+        """获取现货交易对数据（按交易所）"""
+        data = await self.hub.coinglass.get_spot_pairs(symbol=self._base_symbol(symbol))
+        return self._format_response(f"{symbol} Spot Pairs by Exchange", data)
+
+    # ──────────────────────────────────────────────
+    # 期权 (Options)
+    # ──────────────────────────────────────────────
+
+    async def _option_info(self, symbol: str, **_) -> str:
+        """获取期权市场概览（OI、成交量、按交易所分）"""
+        data = await self.hub.coinglass.get_option_info(symbol=self._base_symbol(symbol))
+        return self._format_response(f"{symbol} Options Market Overview", data)
+
+    async def _option_max_pain(self, symbol: str, exchange: str | None = None, **_) -> str:
+        """获取期权最大痛点（按到期日）"""
+        data = await self.hub.coinglass.get_option_max_pain(
+            symbol=self._base_symbol(symbol),
+            exchange=exchange or "Deribit",
+        )
+        return self._format_response(f"{symbol} Options Max Pain", data)
 
     # ──────────────────────────────────────────────
     # 链上数据 (On-chain)
@@ -1325,6 +1321,102 @@ class MarketDataTool(Tool):
         """获取恐惧贪婪指数"""
         data = await self.hub.coinglass.get_fear_greed()
         return self._format_response("Fear & Greed Index", data)
+
+    # ──────────────────────────────────────────────
+    # AHR999 Bitcoin Valuation
+    # ──────────────────────────────────────────────
+
+    async def _ahr999(self, **_) -> str:
+        """获取 AHR999 BTC 估值指标"""
+        data = await self.hub.coinglass.get_ahr999()
+        if isinstance(data, list) and len(data) > 30:
+            # Only return recent 30 entries to keep context manageable
+            data = data[-30:]
+        return self._format_response("AHR999 Bitcoin Valuation Index", data)
+
+    # ──────────────────────────────────────────────
+    # Liquidation Coin List (全币种清算排行)
+    # ──────────────────────────────────────────────
+
+    async def _liquidation_coin_list(self, limit: int | None = None, **_) -> str:
+        """获取全币种清算排行（24h/12h/4h/1h）"""
+        data = await self.hub.coinglass.get_liquidation_coin_list()
+        if isinstance(data, dict) and "error" in data:
+            return self._format_response("Liquidation Coin List", data)
+        if not isinstance(data, list):
+            return self._format_response("Liquidation Coin List", {"error": "Unexpected response"})
+
+        # Sort by 24h total liquidation USD descending
+        data.sort(
+            key=lambda t: float(t.get("liquidation_usd_24h") or 0),
+            reverse=True,
+        )
+        cap = min(limit or 20, 50)
+        top = data[:cap]
+
+        results = []
+        for t in top:
+            results.append({
+                "symbol": t.get("symbol"),
+                "liq_24h_usd": round(float(t.get("liquidation_usd_24h") or 0), 2),
+                "long_liq_24h": round(float(t.get("long_liquidation_usd_24h") or 0), 2),
+                "short_liq_24h": round(float(t.get("short_liquidation_usd_24h") or 0), 2),
+                "liq_4h_usd": round(float(t.get("liquidation_usd_4h") or 0), 2),
+                "liq_1h_usd": round(float(t.get("liquidation_usd_1h") or 0), 2),
+            })
+        return self._format_response("Liquidation Coin Ranking (top by 24h)", {
+            "count": len(results),
+            "coins": results,
+        })
+
+    # ──────────────────────────────────────────────
+    # Token Unlocks
+    # ──────────────────────────────────────────────
+
+    async def _token_unlocks(self, limit: int | None = None, **_) -> str:
+        """获取即将到来的代币解锁时间表"""
+        # Fetch enough tokens to have a good selection after filtering
+        per_page = min(max(limit or 50, 50), 100)
+        data = await self.hub.coinglass.get_token_unlocks(per_page=per_page)
+        if isinstance(data, dict) and "error" in data:
+            return self._format_response("Token Unlocks", data)
+
+        if not isinstance(data, list):
+            return self._format_response("Token Unlocks", {"error": "Unexpected response"})
+
+        # Keep tokens that have a next unlock date (Coinglass auto-updates after unlock)
+        upcoming = [t for t in data if t.get("next_unlock_date")]
+        # Sort by next unlock date ascending (soonest first)
+        upcoming.sort(key=lambda t: t["next_unlock_date"])
+
+        results = []
+        for t in upcoming:
+            from datetime import datetime, timezone
+            unlock_dt = datetime.fromtimestamp(
+                t["next_unlock_date"] / 1000, tz=timezone.utc
+            )
+            results.append({
+                "symbol": t.get("symbol"),
+                "name": t.get("name"),
+                "price": t.get("price"),
+                "market_cap": t.get("market_cap"),
+                "next_unlock_date": unlock_dt.strftime("%Y-%m-%d"),
+                "next_unlock_tokens": t.get("next_unlock_tokens"),
+                "next_unlock_usd": t.get("next_unlock_usd"),
+                "next_unlock_pct_circulating": round(
+                    (t.get("next_unlock_of_circulating") or 0) * 1, 4
+                ),
+                "next_unlock_pct_supply": round(
+                    (t.get("next_unlock_of_supply") or 0) * 1, 4
+                ),
+                "circulating_supply": t.get("circulating_supply"),
+                "total_locked": t.get("total_locked"),
+            })
+
+        return self._format_response("Token Unlocks (upcoming)", {
+            "count": len(results),
+            "tokens": results,
+        })
 
     # ──────────────────────────────────────────────
     # 工具方法

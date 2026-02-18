@@ -8,12 +8,14 @@ Supports:
 """
 
 import asyncio
-import hashlib
+import datetime
 import json
+import platform
 import re
 import threading
 import time as _time
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +37,7 @@ try:
         CreateFileRequest,
         CreateFileRequestBody,
         GetMessageResourceRequest,
+        ListChatRequest,
         Emoji,
         GetChatMembersRequest,
         P2ImMessageReceiveV1,
@@ -56,6 +59,19 @@ _MSG_TYPE_MAP = {
 
 _MEMBER_CACHE_TTL = 300  # 5 minutes
 _SENT_MSG_ID_CACHE_MAX = 2000
+_MAX_CARD_TABLES = 5  # Lark card: max native table components per card
+
+
+@dataclass
+class _RenderPlan:
+    """Structured presentation decision for one outbound Feishu message."""
+
+    mode: str = "text"  # "text" | "interactive"
+    mention_sender: bool = False
+    title: str = ""
+    body: str = ""
+    confidence: float = 0.0
+    rationale: str = ""
 
 
 def _split_into_chunks(text: str) -> list[str]:
@@ -166,6 +182,10 @@ class FeishuChannel(BaseChannel):
         self._reaction_model: str = ""
         self._reaction_reasoning_effort: str = ""
         self._reaction_llm_init_attempted = False
+        self._render_llm: Any = None
+        self._render_model: str = ""
+        self._render_reasoning_effort: str = ""
+        self._render_llm_init_attempted = False
 
     # ── helpers ──
 
@@ -176,6 +196,193 @@ class FeishuChannel(BaseChannel):
 
     def _domain_label(self) -> str:
         return "Lark" if self.config.domain.lower() == "lark" else "Feishu"
+
+    # ── bot identity ──
+
+    def _fetch_bot_open_id_sync(self) -> None:
+        """Fetch the bot's own open_id via ``GET /open-apis/bot/v3/info``.
+
+        Must be called after ``self._client`` is initialized.
+        Sets ``self._bot_open_id`` on success; logs a warning on failure
+        so the heuristic fallback can still kick in later.
+        """
+        if not self._client:
+            return
+        try:
+            from lark_oapi.core.http import HttpMethod
+            from lark_oapi.core.model.base_request import BaseRequest
+
+            req = BaseRequest()
+            req.uri = "/open-apis/bot/v3/info"
+            req.http_method = HttpMethod.GET
+            req.token_types = {lark.AccessTokenType.TENANT}
+
+            resp = self._client.request(req)
+            if resp.code == 0 and resp.raw and resp.raw.content:
+                data = json.loads(resp.raw.content)
+                bot_info = data.get("bot", {})
+                open_id = bot_info.get("open_id", "")
+                if open_id:
+                    self._bot_open_id = open_id
+                    logger.info(f"Bot open_id from API: {open_id}")
+                    return
+            logger.warning(
+                f"Bot info API returned no open_id: code={resp.code}, "
+                f"msg={getattr(resp, 'msg', '')}"
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to fetch bot open_id via API: {exc}")
+
+    # ── lifecycle notifications ──
+
+    def _list_bot_group_chat_ids_sync(self) -> list[str]:
+        """List all *group* chat_ids the bot has joined (blocking, paginated).
+
+        Filters out p2p chats — only ``oc_`` prefixed IDs are returned.
+        """
+        if not self._client:
+            return []
+        chat_ids: list[str] = []
+        page_token: str | None = None
+        try:
+            while True:
+                builder = ListChatRequest.builder().page_size(100)
+                if page_token:
+                    builder = builder.page_token(page_token)
+                resp = self._client.im.v1.chat.list(builder.build())
+                if not resp.success():
+                    logger.warning(
+                        f"List chats failed: code={resp.code}, msg={resp.msg}"
+                    )
+                    break
+                data = resp.data
+                if data and data.items:
+                    for chat in data.items:
+                        cid = chat.chat_id or ""
+                        # Only group chats (oc_ prefix); skip p2p / unknown
+                        if cid.startswith("oc_"):
+                            chat_ids.append(cid)
+                if not data or not data.has_more:
+                    break
+                page_token = data.page_token
+        except Exception as exc:
+            logger.warning(f"Error listing bot chats: {exc}")
+        return chat_ids
+
+    def _resolve_notification_targets_sync(self) -> list[str]:
+        """Determine which chat_ids should receive lifecycle notifications.
+
+        - If ``notification_chat_ids`` is configured, use that (explicit override).
+        - Otherwise, auto-discover all group chats the bot has joined.
+        """
+        if self.config.notification_chat_ids:
+            return list(self.config.notification_chat_ids)
+        return self._list_bot_group_chat_ids_sync()
+
+    # CloudsWay MaaS model IDs → human-readable names
+    _MODEL_DISPLAY_NAMES: dict[str, str] = {
+        "maas_cl_sonnet_4.5": "Claude Sonnet 4.5",
+        "maas_cl_sonnet_4": "Claude Sonnet 4",
+        "maas_cl_opus_4": "Claude Opus 4",
+        "maas_cl_haiku_3.5": "Claude Haiku 3.5",
+        "maas_gpt_4o": "GPT-4o",
+        "maas_gpt_4.1": "GPT-4.1",
+        "maas_o3": "o3",
+        "maas_o4_mini": "o4-mini",
+    }
+
+    @classmethod
+    def _friendly_model_name(cls, model: str) -> str:
+        """Convert internal model IDs to human-readable names."""
+        return cls._MODEL_DISPLAY_NAMES.get(model.lower(), model)
+
+    def _build_lifecycle_card(self, event: str) -> str:
+        """Build an interactive card for a lifecycle event.
+
+        ``event`` is ``"online"`` or ``"offline"``.
+        """
+        from getall import __version__
+        from getall.config.loader import load_config
+
+        is_online = event == "online"
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        emoji = "🟢" if is_online else "🔴"
+        title = f"{emoji} {'已上线' if is_online else '已下线'}"
+        template = "green" if is_online else "red"
+        status_text = (
+            "**运行中** — 随时待命"
+            if is_online
+            else "**停机中** — 维护更新"
+        )
+        detail = (
+            f"**状态：** {status_text}\n"
+            f"**版本：** v{__version__}\n"
+            f"**时间：** {now}\n"
+            f"**主机：** {platform.node()}"
+        )
+        if is_online:
+            try:
+                cfg = load_config()
+                model = cfg.agents.defaults.model
+                if model:
+                    detail += f"\n**模型：** {self._friendly_model_name(model)}"
+            except Exception:
+                pass
+        card: dict[str, Any] = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": title, "tag": "plain_text"},
+                "template": template,
+            },
+            "elements": [{"tag": "markdown", "content": detail}],
+        }
+        return json.dumps(card, ensure_ascii=False)
+
+    def _send_lifecycle_notification_sync(self, event: str) -> None:
+        """Send lifecycle card to target chat_ids (blocking).
+
+        Automatically discovers all bot groups unless overridden by config.
+        """
+        if not self._client:
+            return
+        targets = self._resolve_notification_targets_sync()
+        if not targets:
+            logger.debug("No notification targets found, skipping lifecycle card")
+            return
+        card = self._build_lifecycle_card(event)
+        for chat_id in targets:
+            try:
+                req = (
+                    CreateMessageRequest.builder()
+                    .receive_id_type("chat_id")
+                    .request_body(
+                        CreateMessageRequestBody.builder()
+                        .receive_id(chat_id)
+                        .msg_type("interactive")
+                        .content(card)
+                        .build()
+                    )
+                    .build()
+                )
+                resp = self._client.im.v1.message.create(req)
+                if resp.success():
+                    logger.info(f"Sent {event} notification to {chat_id}")
+                else:
+                    logger.warning(
+                        f"Lifecycle notification failed ({chat_id}): "
+                        f"code={resp.code}, msg={resp.msg}"
+                    )
+            except Exception as exc:
+                logger.warning(f"Error sending lifecycle notification to {chat_id}: {exc}")
+
+    async def send_lifecycle_notification(self, event: str) -> None:
+        """Async wrapper — runs blocking send in executor."""
+        if not self._client:
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, self._send_lifecycle_notification_sync, event
+        )
 
     # ── lifecycle ──
 
@@ -245,6 +452,9 @@ class FeishuChannel(BaseChannel):
             .build()
         )
 
+        # Fetch bot's own open_id via API (reliable, not heuristic)
+        self._fetch_bot_open_id_sync()
+
         # Event dispatcher (reused by both WS and webhook paths)
         self.get_event_handler()
 
@@ -276,11 +486,26 @@ class FeishuChannel(BaseChannel):
             self._ws_thread.start()
             logger.info(f"{label} bot started (WebSocket long connection)")
 
+        # Send "online" notification after client is ready
+        try:
+            await self.send_lifecycle_notification("online")
+        except Exception as exc:
+            logger.warning(f"Failed to send online notification: {exc}")
+
         while self._running:
             await asyncio.sleep(1)
 
     async def stop(self) -> None:
+        if not self._running:
+            return
         self._running = False
+
+        # Send "offline" notification before teardown
+        try:
+            await self.send_lifecycle_notification("offline")
+        except Exception as exc:
+            logger.warning(f"Failed to send offline notification: {exc}")
+
         if self._ws_client:
             try:
                 self._ws_client.stop()
@@ -342,16 +567,37 @@ class FeishuChannel(BaseChannel):
 
     # ── @mention resolution ──
 
-    _AT_RE = re.compile(r"@([\w\u4e00-\u9fff]+(?:\s[\w\u4e00-\u9fff]+){0,2})")
+    _AT_RE = re.compile(r"@([\w\u4e00-\u9fff]+(?:\s[\w\u4e00-\u9fff]+){0,4})")
+
+    _AT_ALL_NAMES = frozenset({"all", "所有人", "everyone", "全体", "全体成员"})
 
     def _resolve_at_tags(self, chat_id: str, text: str) -> str:
-        """Replace @name in LLM output with Lark <at> markdown tags."""
+        """Replace @name in LLM output with Lark <at> markdown tags.
+
+        Handles ``@all`` / ``@所有人`` → ``<at id=all>所有人</at>``.
+        For person mentions, tries progressively shorter word sequences
+        so ``@Monica Wan 后续文字`` correctly resolves "Monica Wan" and
+        leaves "后续文字" untouched.
+        """
 
         def _replace(m: re.Match[str]) -> str:
-            name = m.group(1)
-            oid = self._members.resolve_name(chat_id, name)
-            if oid:
-                return f"<at id={oid}>{name}</at>"
+            full = m.group(1)
+
+            # Try progressively shorter word sequences until we find a match
+            words = full.split()
+            for n in range(len(words), 0, -1):
+                candidate = " ".join(words[:n])
+                rest = full[len(candidate):]
+
+                # @all / @所有人 / @everyone
+                if candidate.lower() in self._AT_ALL_NAMES:
+                    return f"<at id=all>所有人</at>{rest}"
+
+                # Named member
+                oid = self._members.resolve_name(chat_id, candidate)
+                if oid:
+                    return f"<at id={oid}>{candidate}</at>{rest}"
+
             return m.group(0)
 
         return self._AT_RE.sub(_replace, text)
@@ -362,27 +608,307 @@ class FeishuChannel(BaseChannel):
         name = self._members.display_name(chat_id, sender_open_id)
         return f"<at id={sender_open_id}>{name}</at> {text}"
 
+    def _prepend_sender_plain(
+        self, chat_id: str, sender_open_id: str, text: str
+    ) -> str:
+        """Plain-text @prefix fallback when card rendering is unavailable."""
+        name = self._members.display_name(chat_id, sender_open_id)
+        handle = f"@{name}" if name and name != sender_open_id else f"@{sender_open_id}"
+        return f"{handle} {text}".strip()
+
     # ── reaction ──
 
     _REACTION_EMOJI_CHOICES: tuple[str, ...] = FEISHU_REACTION_EMOJI_CHOICES
-    _REACTION_FALLBACK_TEXT: tuple[str, ...] = (
-        "THUMBSUP",
-        "SMILE",
-        "JIAYI",
-        "DONE",
-        "PARTY",
-        "FIRE",
-        "HEART",
-        "WAVE",
-        "WOW",
-        "THINKING",
-    )
-    _REACTION_FALLBACK_NON_TEXT: tuple[str, ...] = (
-        "THUMBSUP",
-        "SMILE",
-        "JIAYI",
-        "WOW",
-    )
+    _REACTION_FALLBACK_EMOJI = "THUMBSUP"
+    _REACTION_TOOL_NAME = "select_reaction_emoji"
+    _RENDER_TOOL_NAME = "plan_feishu_render"
+
+    @staticmethod
+    def _extract_json_object(text: str) -> dict[str, Any] | None:
+        """Best-effort parse for a JSON object from model text output."""
+        raw = (text or "").strip()
+        if not raw:
+            return None
+        candidates = [raw]
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            candidates.append(match.group(0))
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+            except Exception:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+        return None
+
+    @staticmethod
+    def _fallback_render_mode(
+        text: str, has_images: bool, has_actions: bool
+    ) -> str:
+        """Fallback mode when planner LLM is unavailable.
+
+        Pure-agent policy: no content heuristics here.
+        Keep only hard rendering constraints that cannot be inferred without
+        model output.
+        """
+        if has_images or has_actions:
+            return "interactive"
+        return "text"
+
+    @staticmethod
+    def _coerce_bool(value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "y"}:
+                return True
+            if normalized in {"false", "0", "no", "n", ""}:
+                return False
+        return default
+
+    @classmethod
+    def _coerce_render_plan(
+        cls,
+        payload: dict[str, Any],
+        *,
+        original_content: str,
+        is_group: bool,
+        sender_open_id: str,
+        has_images: bool,
+        has_actions: bool,
+        fallback_mode: str,
+    ) -> _RenderPlan:
+        """Normalize planner payload and enforce platform hard constraints."""
+        mode_raw = str(payload.get("mode") or "").strip().lower()
+        mode = mode_raw if mode_raw in {"text", "interactive"} else fallback_mode
+
+        mention_sender = cls._coerce_bool(
+            payload.get("mention_sender"),
+            default=False,
+        )
+
+        body = str(payload.get("body") or "").strip()
+        if not body:
+            body = (original_content or "").strip()
+
+        title = str(payload.get("title") or "").strip()
+        if title:
+            title = re.sub(r"^#{1,6}\s*", "", title).strip()
+            if len(title) > 80:
+                title = title[:80].rstrip()
+
+        confidence = 0.0
+        raw_conf = payload.get("confidence")
+        if raw_conf is not None:
+            try:
+                confidence = float(raw_conf)
+            except (TypeError, ValueError):
+                confidence = 0.0
+        confidence = max(0.0, min(1.0, confidence))
+        rationale = str(payload.get("rationale") or "").strip()
+
+        if not is_group or not sender_open_id:
+            mention_sender = False
+
+        # Hard constraints: media/actions and platform @mention behavior.
+        if has_images or has_actions:
+            mode = "interactive"
+        if mention_sender and sender_open_id:
+            mode = "interactive"
+
+        return _RenderPlan(
+            mode=mode,
+            mention_sender=mention_sender,
+            title=title,
+            body=body,
+            confidence=confidence,
+            rationale=rationale,
+        )
+
+    def _init_render_llm(self) -> None:
+        """Lazy init an LLM client used for render planning."""
+        if self._render_llm_init_attempted:
+            return
+        self._render_llm_init_attempted = True
+        try:
+            from getall.config.loader import load_config
+            from getall.providers.litellm_provider import LiteLLMProvider
+
+            cfg = load_config()
+            provider = cfg.get_provider()
+            if not (provider and provider.api_key):
+                logger.warning(
+                    "Render planner LLM disabled: no provider API key configured"
+                )
+                return
+
+            self._render_model = cfg.agents.defaults.model
+            self._render_reasoning_effort = (
+                cfg.agents.defaults.reasoning_effort or ""
+            )
+            self._render_llm = LiteLLMProvider(
+                api_key=provider.api_key,
+                api_base=cfg.get_api_base(),
+                default_model=self._render_model,
+                extra_headers=provider.extra_headers,
+                provider_name=cfg.get_provider_name(),
+            )
+        except Exception as exc:
+            logger.warning(f"Render planner LLM init failed: {exc}")
+
+    async def _plan_render(
+        self,
+        *,
+        content: str,
+        chat_id: str,
+        is_group: bool,
+        sender_open_id: str,
+        has_images: bool,
+        has_actions: bool,
+        source: str = "",
+    ) -> _RenderPlan:
+        """Use a dedicated LLM call to decide message presentation."""
+        text = (content or "").strip()
+        fallback_mode = self._fallback_render_mode(
+            text, has_images=has_images, has_actions=has_actions
+        )
+        fallback_plan = self._coerce_render_plan(
+            {},
+            original_content=text,
+            is_group=is_group,
+            sender_open_id=sender_open_id,
+            has_images=has_images,
+            has_actions=has_actions,
+            fallback_mode=fallback_mode,
+        )
+        if not text:
+            return fallback_plan
+
+        self._init_render_llm()
+        if not self._render_llm:
+            return fallback_plan
+
+        sender_name = (
+            self._members.display_name(chat_id, sender_open_id)
+            if sender_open_id
+            else ""
+        )
+        planner_input = {
+            "chat_type": "group" if is_group else "private",
+            "source": source or "normal",
+            "sender_mention_available": bool(sender_open_id),
+            "sender_name": sender_name,
+            "has_images": bool(has_images),
+            "has_actions": bool(has_actions),
+            "content": text[:8000],
+        }
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": self._RENDER_TOOL_NAME,
+                    "description": (
+                        "Plan Feishu render strategy and provide final body "
+                        "for display."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "mode": {
+                                "type": "string",
+                                "enum": ["text", "interactive"],
+                            },
+                            "mention_sender": {"type": "boolean"},
+                            "title": {"type": "string"},
+                            "body": {"type": "string"},
+                            "confidence": {"type": "number"},
+                            "rationale": {"type": "string"},
+                        },
+                        "required": ["mode", "mention_sender", "body"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a presentation planner for a Feishu/Lark AI "
+                    "assistant. Your goal is to maximize human-like delivery "
+                    "quality.\n"
+                    "Call the tool plan_feishu_render exactly once.\n"
+                    "Keep facts, numbers, links, and commitments unchanged.\n"
+                    "Prefer mode=text for brief conversational or progress "
+                    "updates.\n"
+                    "Prefer mode=interactive for dense structured reports, "
+                    "multi-section briefs, or visual hierarchy.\n"
+                    "Use mention_sender=true only when direct person-targeting "
+                    "improves clarity.\n"
+                    "For mode=text, output natural conversational body "
+                    "without markdown heading markers.\n"
+                    "For mode=interactive, preserve structure and readability."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(planner_input, ensure_ascii=False),
+            },
+        ]
+        try:
+            response = await asyncio.wait_for(
+                self._render_llm.chat(
+                    messages=messages,
+                    tools=tools,
+                    model=self._render_model,
+                    max_tokens=600,
+                    temperature=0.1,
+                    reasoning_effort=self._render_reasoning_effort,
+                ),
+                timeout=12.0,
+            )
+            payload: dict[str, Any] | None = None
+            for call in response.tool_calls:
+                if call.name == self._RENDER_TOOL_NAME and isinstance(
+                    call.arguments, dict
+                ):
+                    payload = call.arguments
+                    break
+            if payload is None and response.content:
+                payload = self._extract_json_object(response.content)
+            if payload is None:
+                logger.warning(
+                    "Render planner returned no structured payload; using fallback plan"
+                )
+                return fallback_plan
+
+            plan = self._coerce_render_plan(
+                payload,
+                original_content=text,
+                is_group=is_group,
+                sender_open_id=sender_open_id,
+                has_images=has_images,
+                has_actions=has_actions,
+                fallback_mode=fallback_mode,
+            )
+            logger.debug(
+                "Render plan decided: "
+                f"mode={plan.mode}, mention_sender={plan.mention_sender}, "
+                f"title_len={len(plan.title)}, confidence={plan.confidence:.2f}, "
+                f"source={source or 'normal'}"
+            )
+            return plan
+        except Exception as exc:
+            logger.warning(
+                f"Render planner failed; using fallback plan: {exc}"
+            )
+            return fallback_plan
 
     def _init_reaction_llm(self) -> None:
         """Lazy init a lightweight LLM client for emoji selection."""
@@ -414,30 +940,118 @@ class FeishuChannel(BaseChannel):
         except Exception as exc:
             logger.warning(f"Reaction LLM init failed: {exc}")
 
-    @staticmethod
-    def _stable_pick(options: tuple[str, ...], seed: str) -> str:
-        if not options:
-            return "THUMBSUP"
-        digest = hashlib.sha1(seed.encode("utf-8")).digest()
-        idx = int.from_bytes(digest[:4], "big") % len(options)
-        return options[idx]
+    async def _reformat_for_card(self, content: str) -> str:
+        """Use the LLM to rewrite *content* with ≤3 markdown tables.
+
+        Called as a fallback when a Lark card exceeds the native table
+        component limit.  The LLM is asked to preserve all data but merge
+        or convert excess tables into bullet lists / bold key-value pairs.
+        If the LLM is unavailable or fails, return *content* with tables
+        stripped to plain key-value lines (best-effort programmatic
+        fallback).
+        """
+        self._init_reaction_llm()
+        if self._reaction_llm:
+            try:
+                resp = await asyncio.wait_for(
+                    self._reaction_llm.chat(
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are a formatting assistant. The user "
+                                    "will give you a markdown message that "
+                                    "contains too many tables for a Lark/Feishu "
+                                    "message card (max 5 native tables).\n\n"
+                                    "Rewrite the message so it has AT MOST 3 "
+                                    "markdown tables. Convert the rest into "
+                                    "compact bullet lists or **bold key**: "
+                                    "value lines. Keep ALL data — nothing may "
+                                    "be dropped. Preserve headings, emojis, "
+                                    "and overall structure. Output ONLY the "
+                                    "rewritten markdown, no commentary."
+                                ),
+                            },
+                            {"role": "user", "content": content},
+                        ],
+                        model=self._reaction_model,
+                        max_tokens=4096,
+                        temperature=0.2,
+                        reasoning_effort=self._reaction_reasoning_effort,
+                    ),
+                    timeout=30.0,
+                )
+                reformatted = (resp.content or "").strip()
+                if reformatted and len(reformatted) > 100:
+                    logger.info(
+                        "Card content reformatted by LLM "
+                        f"({len(content)} → {len(reformatted)} chars)"
+                    )
+                    return reformatted
+            except Exception as exc:
+                logger.warning(f"LLM reformat failed, using programmatic "
+                               f"fallback: {exc}")
+
+        # ── Programmatic fallback: convert tables to key-value lines ──
+        import re as _re
+        def _table_to_kv(match: _re.Match[str]) -> str:
+            lines = [
+                ln.strip()
+                for ln in match.group(1).strip().split("\n")
+                if ln.strip()
+            ]
+            if len(lines) < 2:
+                return match.group(0)
+            headers = [c.strip() for c in lines[0].strip("|").split("|")]
+            sep_idx = 1 if _re.match(r"^[ \t]*\|[-:\s|]+\|", lines[1]) else -1
+            data_start = sep_idx + 1 if sep_idx >= 0 else 1
+            out: list[str] = []
+            for row in lines[data_start:]:
+                cells = [c.strip() for c in row.strip("|").split("|")]
+                pairs = " | ".join(
+                    f"**{headers[i]}** {cells[i]}"
+                    for i in range(min(len(headers), len(cells)))
+                    if cells[i]
+                )
+                if pairs:
+                    out.append(f"- {pairs}")
+            return "\n".join(out) if out else match.group(0)
+
+        return self._TABLE_RE.sub(_table_to_kv, content)
 
     def _fallback_reaction_emoji(
         self,
-        message_id: str,
-        msg_type: str,
-        content: str,
-        chat_type: str,
     ) -> str:
-        text = (content or "").strip()
-        seed = f"{chat_type}|{msg_type}|{message_id}|{text[:120]}"
-        if msg_type != "text":
-            return self._stable_pick(self._REACTION_FALLBACK_NON_TEXT, seed)
-        if text.endswith(("?", "？")):
-            return self._stable_pick(("THINKING", "WOW", "SMILE"), seed)
-        if len(text) <= 8:
-            return self._stable_pick(("SMILE", "WAVE", "THUMBSUP"), seed)
-        return self._stable_pick(self._REACTION_FALLBACK_TEXT, seed)
+        """Protocol-safe fallback when reaction planner is unavailable.
+
+        Pure-agent policy: no heuristic mapping from text patterns to emoji.
+        Keep a single safe token as deterministic fallback, while guaranteeing
+        the value is part of Feishu's supported enum.
+        """
+        if self._REACTION_FALLBACK_EMOJI in self._REACTION_EMOJI_CHOICES:
+            return self._REACTION_FALLBACK_EMOJI
+        if self._REACTION_EMOJI_CHOICES:
+            return self._REACTION_EMOJI_CHOICES[0]
+        return "THUMBSUP"
+
+    @classmethod
+    def _normalize_reaction_token(cls, token: str) -> str:
+        """Return canonical emoji_type token or empty string if invalid."""
+        candidate = (token or "").strip()
+        if not candidate:
+            return ""
+        if candidate in cls._REACTION_EMOJI_CHOICES:
+            return candidate
+        lowered = candidate.lower()
+        if not lowered:
+            return ""
+        hits = [
+            name for name in cls._REACTION_EMOJI_CHOICES
+            if name.lower() == lowered
+        ]
+        if len(hits) == 1:
+            return hits[0]
+        return ""
 
     async def _choose_reaction_emoji(
         self,
@@ -445,13 +1059,9 @@ class FeishuChannel(BaseChannel):
         msg_type: str,
         content: str,
         chat_type: str,
+        event_hint: str = "",
     ) -> str:
-        fallback = self._fallback_reaction_emoji(
-            message_id=message_id,
-            msg_type=msg_type,
-            content=content,
-            chat_type=chat_type,
-        )
+        fallback = self._fallback_reaction_emoji()
         self._init_reaction_llm()
         if not self._reaction_llm:
             return fallback
@@ -460,20 +1070,53 @@ class FeishuChannel(BaseChannel):
         if len(content_preview) > 240:
             content_preview = f"{content_preview[:240]}..."
 
-        allowed = ", ".join(self._REACTION_EMOJI_CHOICES)
+        # Build event-aware system prompt for reaction emoji selection
+        event_instruction = ""
+        if event_hint:
+            event_instruction = (
+                f"\nA special event is active: {event_hint}. "
+                "Strongly prefer themed emojis that match the event mood "
+                "(e.g. LOVE/HEART/KISS/ROSE/FINGERHEART for romance, "
+                "REDPACKET/FORTUNE/LUCK/FIRECRACKER for Chinese New Year, "
+                "PARTY/BEER/Fire for Friday night, etc.).\n"
+            )
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": self._REACTION_TOOL_NAME,
+                    "description": (
+                        "Select one valid Feishu reaction emoji_type for this message."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "emoji_type": {
+                                "type": "string",
+                                "enum": list(self._REACTION_EMOJI_CHOICES),
+                            },
+                            "rationale": {"type": "string"},
+                        },
+                        "required": ["emoji_type"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
         messages = [
             {
                 "role": "system",
                 "content": (
                     "You pick ONE Lark reaction emoji_type for a user message.\n"
-                    "Return exactly one token from the allowed list only.\n"
-                    "No explanation, no punctuation, no markdown."
+                    "Call tool select_reaction_emoji exactly once.\n"
+                    "No free text output.\n"
+                    f"Choose the most human-like reaction for the context.{event_instruction}"
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    f"allowed: {allowed}\n"
                     f"message_id: {message_id}\n"
                     f"chat_type: {chat_type}\n"
                     f"msg_type: {msg_type}\n"
@@ -485,32 +1128,39 @@ class FeishuChannel(BaseChannel):
             response = await asyncio.wait_for(
                 self._reaction_llm.chat(
                     messages=messages,
+                    tools=tools,
                     model=self._reaction_model,
-                    max_tokens=16,
+                    max_tokens=64,
                     temperature=0.1,
                     reasoning_effort=self._reaction_reasoning_effort,
                 ),
                 timeout=4.0,
             )
-            raw = (response.content or "").strip()
-            match = re.search(r"[A-Za-z0-9_]+", raw)
-            candidate = match.group(0) if match else ""
-            if candidate in self._REACTION_EMOJI_CHOICES:
-                return candidate
+            # Preferred path: structured tool call.
+            for call in response.tool_calls:
+                if call.name != self._REACTION_TOOL_NAME:
+                    continue
+                if not isinstance(call.arguments, dict):
+                    continue
+                token = self._normalize_reaction_token(
+                    str(call.arguments.get("emoji_type", ""))
+                )
+                if token:
+                    return token
 
-            # Be tolerant to case mismatches from model output while
-            # still returning the documented canonical emoji_type token.
-            lowered = candidate.lower()
-            if lowered:
-                case_insensitive_hits = [
-                    name
-                    for name in self._REACTION_EMOJI_CHOICES
-                    if name.lower() == lowered
-                ]
-                if len(case_insensitive_hits) == 1:
-                    return case_insensitive_hits[0]
+            # Secondary path: tolerate provider/model returning JSON text.
+            if response.content:
+                payload = self._extract_json_object(response.content)
+                if isinstance(payload, dict):
+                    token = self._normalize_reaction_token(
+                        str(payload.get("emoji_type", ""))
+                    )
+                    if token:
+                        return token
+
             logger.warning(
-                f"Reaction LLM returned invalid emoji_type '{raw}', using fallback={fallback}"
+                "Reaction planner returned no valid structured emoji_type; "
+                f"using fallback={fallback}"
             )
         except Exception as exc:
             logger.warning(f"Reaction LLM choose failed: {exc}")
@@ -550,21 +1200,194 @@ class FeishuChannel(BaseChannel):
 
     # ── outbound (send) ──
 
+    # ── table regexes ──
+
+    # Standard markdown table (with separator) OR pipe table without separator
     _TABLE_RE = re.compile(
-        r"((?:^[ \t]*\|.+\|[ \t]*\n)"
+        r"("
+        # Alt-1: standard markdown table with separator row
+        r"(?:^[ \t]*\|.+\|[ \t]*\n)"
         r"(?:^[ \t]*\|[-:\s|]+\|[ \t]*\n)"
-        r"(?:^[ \t]*\|.+\|[ \t]*\n?)+)",
+        r"(?:^[ \t]*\|.+\|[ \t]*\n?)+"
+        r"|"
+        # Alt-2: pipe table without separator (3+ consecutive rows)
+        r"(?:^[ \t]*\|.+\|[ \t]*\n){3,}"
+        r")",
         re.MULTILINE,
     )
 
+    # Box-drawing table (┌─┬─┐ │…│ ├─┼─┤ └─┴─┘)
+    _BOX_TABLE_RE = re.compile(
+        r"((?:^[ \t]*[┌├└│].*\n?)+)",
+        re.MULTILINE,
+    )
+
+    # ── heading / header extraction ──
+
+    _HEADING_RE = re.compile(r"^#{1,2}\s+(.+?)$", re.MULTILINE)
+
+    # After the first heading is extracted for the card header,
+    # ALL remaining headings (#, ##, ###, …) must be downgraded to bold.
+    # Lark card markdown technically lists # / ## as "supported" but in
+    # practice rendering is unreliable inside card elements, so we
+    # convert every heading to **bold** for guaranteed visibility.
+    _ANY_HEADING_RE = re.compile(r"^#{1,6}\s+(.+?)$", re.MULTILINE)
+
+    @classmethod
+    def _downgrade_headings(cls, text: str) -> str:
+        """Replace any remaining ``# heading`` … ``###### heading`` with ``**heading**``.
+
+        If the heading text already contains ``**bold**`` markers, they are
+        stripped first to avoid broken ``****`` nesting.
+        """
+
+        def _repl(m: re.Match) -> str:
+            inner = m.group(1).replace("**", "").strip()
+            return f"**{inner}**"
+
+        return cls._ANY_HEADING_RE.sub(_repl, text)
+
+    # Inline code (single/double backtick) is NOT supported by Lark card
+    # markdown — only fenced code blocks (triple backtick) work.
+    # Strip the backtick delimiters, keeping the content as plain text.
+    # Ref: https://www.feishu.cn/content/7gprunv5 (no inline code listed)
+    _INLINE_CODE_RE = re.compile(r"(?<!`)(`{1,2})(?!`)(.*?)(?<!`)\1(?!`)")
+
+    # Stray empty backtick sequences on their own lines (e.g. lone `` or ```).
+    _STRAY_BACKTICKS_RE = re.compile(r"^[ \t]*`{1,3}[ \t]*$", re.MULTILINE)
+
+    # Leftover markdown image syntax with file:// or other schemes that
+    # _extract_image_paths couldn't fully clean.
+    _LEFTOVER_IMG_RE = re.compile(
+        r"!\[[^\]]*\]\([^)]*\)", re.IGNORECASE
+    )
+
+    # Orphaned labels left behind after image path extraction, e.g.
+    # "图表路径：", "Chart path:", "图表：" followed by empty/whitespace.
+    _ORPHAN_PATH_LABEL_RE = re.compile(
+        r"^[ \t]*(?:图表路径|图表地址|图片路径|路径|[Cc]hart\s*[Pp]ath|[Ff]ile\s*[Pp]ath)"
+        r"[：:\s]*$",
+        re.MULTILINE,
+    )
+
+    @classmethod
+    def _sanitize_lark_md(cls, text: str) -> str:
+        """Sanitise text for Lark card markdown rendering.
+
+        * Strip inline code backticks (unsupported in Lark card markdown).
+        * Remove orphaned empty backtick sequences.
+        * Remove leftover ``![alt](file://...)`` image syntax.
+        * Remove orphaned path labels (e.g. "图表路径：").
+        """
+        # Strip inline code backticks (` or ``) but keep the content.
+        # Preserve fenced code blocks (```) by only matching 1-2 backticks.
+        text = cls._INLINE_CODE_RE.sub(r"\2", text)
+        # Remove stray backtick-only lines
+        text = cls._STRAY_BACKTICKS_RE.sub("", text)
+        # Remove leftover markdown image refs (file:// etc.)
+        text = cls._LEFTOVER_IMG_RE.sub("", text)
+        # Remove orphaned path labels left after image extraction
+        text = cls._ORPHAN_PATH_LABEL_RE.sub("", text)
+        # Collapse excessive blank lines
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+    _VERDICT_COLOR_MAP: dict[str, str] = {
+        "🟢": "green",
+        "🟡": "yellow",
+        "🔴": "red",
+        "✅": "green",
+        "❌": "red",
+    }
+
+    @classmethod
+    def _extract_card_header(
+        cls, content: str
+    ) -> tuple[str, str, str]:
+        """Extract card header title, color template, and remaining body.
+
+        Returns ``(title, template_color, remaining_content)``.
+        * ``title`` comes from the first ``#``/``##`` heading found.
+        * ``template_color`` is derived from verdict emojis (🟢/🟡/🔴).
+        * ``remaining_content`` is the original text minus the heading line.
+        """
+        title = ""
+        remaining = content
+
+        m = cls._HEADING_RE.search(content)
+        if m:
+            # Card header uses plain_text — strip markdown & <at> tags
+            title = m.group(1).replace("**", "").replace("~~", "")
+            title = re.sub(r"<at[^>]*>(.*?)</at>", r"\1", title).strip()
+            remaining = (content[: m.start()] + content[m.end() :]).strip()
+            remaining = re.sub(r"\n{3,}", "\n\n", remaining)
+
+        template = "blue"
+        for emoji, color in cls._VERDICT_COLOR_MAP.items():
+            if emoji in content:
+                template = color
+                break
+
+        return title, template, remaining
+
+    # ── table parsers ──
+
     @staticmethod
     def _parse_md_table(table_text: str) -> dict | None:
+        """Parse a markdown pipe table (with or without separator row)."""
         lines = [ln.strip() for ln in table_text.strip().split("\n") if ln.strip()]
-        if len(lines) < 3:
+        if len(lines) < 2:
             return None
         _split = lambda ln: [c.strip() for c in ln.strip("|").split("|")]
         headers = _split(lines[0])
-        rows = [_split(ln) for ln in lines[2:]]
+
+        # Skip separator row (|---|---|) when present
+        has_sep = len(lines) > 2 and bool(
+            re.match(r"^[ \t]*\|[-:\s|]+\|[ \t]*$", lines[1])
+        )
+        data_start = 2 if has_sep else 1
+        rows = [_split(ln) for ln in lines[data_start:]]
+        if not rows:
+            return None
+
+        cols = [
+            {
+                "tag": "column",
+                "name": f"c{i}",
+                "display_name": h,
+                "width": "auto",
+                "data_type": "lark_md",
+            }
+            for i, h in enumerate(headers)
+        ]
+        return {
+            "tag": "table",
+            "page_size": len(rows) + 1,
+            "columns": cols,
+            "rows": [
+                {f"c{i}": r[i] if i < len(r) else "" for i in range(len(headers))}
+                for r in rows
+            ],
+        }
+
+    @staticmethod
+    def _parse_box_table(table_text: str) -> dict | None:
+        """Parse a box-drawing character table (┌─┬─┐ │…│ └─┴─┘)."""
+        lines = table_text.strip().split("\n")
+        # Keep only data rows (contain │ AND have non-decoration content)
+        data_lines = [
+            ln
+            for ln in lines
+            if "│" in ln
+            and any(c not in "│─┌┐├┤└┘┬┴┼ \t\n" for c in ln)
+        ]
+        if len(data_lines) < 2:
+            return None
+        _split = lambda ln: [c.strip() for c in ln.split("│") if c.strip()]
+        headers = _split(data_lines[0])
+        rows = [_split(ln) for ln in data_lines[1:]]
+        if not headers or not rows:
+            return None
         cols = [
             {"tag": "column", "name": f"c{i}", "display_name": h, "width": "auto"}
             for i, h in enumerate(headers)
@@ -579,22 +1402,100 @@ class FeishuChannel(BaseChannel):
             ],
         }
 
+    # ── card element builder ──
+
+    # ``---`` on its own line — must become a native ``{"tag": "hr"}``
+    # element because the card markdown component does NOT render ``---``.
+    # Ref: https://open.feishu.cn/document/common-capabilities/message-card/message-cards-content/divider-line-module
+    _HR_LINE_RE = re.compile(r"^[ \t]*---[ \t]*$", re.MULTILINE)
+
+    @classmethod
+    def _split_hrs(cls, elements: list[dict]) -> list[dict]:
+        """Replace ``---`` inside markdown elements with native ``hr`` elements.
+
+        Lark card markdown does NOT render ``---`` as a divider — it must be
+        a separate ``{"tag": "hr"}`` element in the card ``elements`` array.
+        """
+        result: list[dict] = []
+        for el in elements:
+            if el.get("tag") != "markdown":
+                result.append(el)
+                continue
+            parts = cls._HR_LINE_RE.split(el["content"])
+            for i, part in enumerate(parts):
+                text = part.strip()
+                if text:
+                    result.append({"tag": "markdown", "content": text})
+                if i < len(parts) - 1:
+                    result.append({"tag": "hr"})
+        return result
+
     def _build_card_elements(self, content: str) -> list[dict]:
+        """Convert markdown content into a list of Lark card ``elements``.
+
+        * Pipe tables and box-drawing tables → native ``table`` components.
+        * ``###`` and deeper headings → downgraded to **bold** (unsupported).
+        * ``---`` dividers → native ``{"tag": "hr"}`` elements.
+        * Everything else → ``markdown`` elements (Lark supports: bold,
+          italic, strikethrough, links, inline code, code blocks,
+          ordered/unordered lists).
+        """
+        # Downgrade ALL remaining headings to bold (first one is already
+        # extracted into the card header by _extract_card_header).
+        content = self._downgrade_headings(content)
+        # Clean up stray backticks, leftover image syntax.
+        content = self._sanitize_lark_md(content)
+
+        # Collect table regions: (start, end, parsed_component | None)
+        regions: list[tuple[int, int, dict | None]] = []
+
+        for m in self._TABLE_RE.finditer(content):
+            regions.append(
+                (m.start(), m.end(), self._parse_md_table(m.group(1)))
+            )
+
+        for m in self._BOX_TABLE_RE.finditer(content):
+            start, end = m.start(), m.end()
+            if any(s <= start < e for s, e, _ in regions):
+                continue  # overlaps with a pipe-table match
+            regions.append((start, end, self._parse_box_table(m.group(1))))
+
+        regions.sort(key=lambda r: r[0])
+
         elements: list[dict] = []
         last = 0
-        for m in self._TABLE_RE.finditer(content):
-            before = content[last : m.start()].strip()
+        native_table_count = 0
+        for start, end, tbl in regions:
+            if start < last:
+                continue
+            before = content[last:start].strip()
             if before:
                 elements.append({"tag": "markdown", "content": before})
-            tbl = self._parse_md_table(m.group(1))
-            elements.append(
-                tbl or {"tag": "markdown", "content": m.group(1)}
-            )
-            last = m.end()
+            # Lark cards have a hard limit on native table components.
+            # Excess tables fall back to markdown text to avoid send errors.
+            if tbl:
+                native_table_count += 1
+                if native_table_count > _MAX_CARD_TABLES:
+                    tbl = None  # keep as markdown
+            if tbl:
+                elements.append(tbl)
+            else:
+                elements.append(
+                    {"tag": "markdown", "content": content[start:end].strip()}
+                )
+            last = end
+
         tail = content[last:].strip()
         if tail:
             elements.append({"tag": "markdown", "content": tail})
-        return elements or [{"tag": "markdown", "content": content}]
+
+        if not elements:
+            elements = [{"tag": "markdown", "content": content}]
+
+        # --- in markdown doesn't render; replace with native hr elements
+        elements = self._split_hrs(elements)
+
+        return elements
 
     _ACTION_KEY_TO_LABEL: dict[str, str] = {
         "view_detail": "查看详情",
@@ -705,14 +1606,136 @@ class FeishuChannel(BaseChannel):
 
     # ── image path extraction ──
 
-    # Match: [GENERATED_IMAGE:/path], ![alt](/path), bare /path/to/file.png
+    # Match: [GENERATED_IMAGE:/path], ![alt](/path), ![alt](file:///path),
+    # bare /path/to/file.png
     _GENERATED_TAG_RE = re.compile(r"\[GENERATED_IMAGE:(.*?)\]")
-    _IMG_PATH_RE = re.compile(
-        r"(?:!\[.*?\]\()?"
-        r"(/[^\s\)\]\"'<>]+\.(?:png|jpg|jpeg|gif|webp|bmp))"
-        r"\)?",
+    # Full markdown image syntax: ![alt](file:///path) or ![alt](/path)
+    _MD_IMG_SYNTAX_RE = re.compile(
+        r"!\[[^\]]*\]\((?:file://)?(/[^\s\)\"'<>]+\.(?:png|jpg|jpeg|gif|webp|bmp))\)",
         re.IGNORECASE,
     )
+    # Bare file path (no markdown syntax)
+    _IMG_PATH_RE = re.compile(
+        r"(?<![(\[])(/[^\s\)\]\"'<>]+\.(?:png|jpg|jpeg|gif|webp|bmp))",
+        re.IGNORECASE,
+    )
+
+    # ── post (rich-text) parsing ──
+
+    def _parse_post_content(
+        self,
+        message: Any,
+        sender_id: str,
+        sender_name: str,
+        chat_id: str,
+        chat_type: str,
+    ) -> tuple[str, str, list[str]]:
+        """Parse a Feishu *post* (rich-text) message into plain text.
+
+        Post content JSON structure::
+
+            {
+              "<locale>": {            # e.g. "zh_cn", "en_us", "ja_jp"
+                "title": "...",
+                "content": [           # list of paragraphs
+                  [                    # each paragraph is a list of elements
+                    {"tag": "text", "text": "Hello "},
+                    {"tag": "at",  "user_id": "ou_xxx", "user_name": "Name"},
+                    {"tag": "a",   "text": "link",  "href": "https://..."},
+                    {"tag": "img", "image_key": "..."},
+                    {"tag": "media", "file_key": "..."},
+                    {"tag": "emotion", "emoji_type": "SMILE"},
+                  ],
+                  ...
+                ]
+              }
+            }
+
+        Returns:
+            (content, sender_name, image_keys) — extracted text,
+            possibly updated sender name, and image keys for download.
+        """
+        try:
+            parsed = json.loads(message.content)
+        except (json.JSONDecodeError, TypeError):
+            return "[post]", sender_name, []
+
+        # Locate the first available locale block
+        locale_block: dict[str, Any] | None = None
+        for locale_key in ("zh_cn", "en_us", "ja_jp"):
+            if locale_key in parsed:
+                locale_block = parsed[locale_key]
+                break
+        if locale_block is None:
+            # Fallback: pick any first dict value that has "content" key
+            for v in parsed.values():
+                if isinstance(v, dict) and "content" in v:
+                    locale_block = v
+                    break
+        if locale_block is None:
+            return "[post]", sender_name, []
+
+        title = locale_block.get("title", "")
+        paragraphs: list[list[dict[str, Any]]] = locale_block.get("content", [])
+
+        lines: list[str] = []
+        if title:
+            lines.append(title)
+
+        bot_mention_names: list[str] = []
+        image_keys: list[str] = []
+
+        for para in paragraphs:
+            if not isinstance(para, list):
+                continue
+            parts: list[str] = []
+            for elem in para:
+                if not isinstance(elem, dict):
+                    continue
+                tag = elem.get("tag", "")
+                if tag == "text":
+                    parts.append(elem.get("text", ""))
+                elif tag == "a":
+                    href = elem.get("href", "")
+                    link_text = elem.get("text", href)
+                    parts.append(f"{link_text}({href})" if href else link_text)
+                elif tag == "at":
+                    user_id = elem.get("user_id", "")
+                    user_name = elem.get("user_name", "") or elem.get("user_name", "")
+                    # Learn sender name from @mention
+                    if user_id == sender_id and user_name:
+                        sender_name = user_name
+                    # Detect bot mention
+                    if self._bot_open_id and user_id == self._bot_open_id:
+                        if user_name:
+                            bot_mention_names.append(user_name)
+                        continue  # Don't include bot @mention in content
+                    # Track group member
+                    if user_id and user_name and chat_type == "group":
+                        if user_id != self._bot_open_id:
+                            self._members.track_sender(chat_id, user_id, user_name)
+                    parts.append(f"@{user_name}" if user_name else f"@{user_id}")
+                elif tag == "img":
+                    ik = elem.get("image_key", "")
+                    if ik:
+                        image_keys.append(ik)
+                    parts.append("[image]")
+                elif tag == "media":
+                    parts.append("[media]")
+                elif tag == "emotion":
+                    parts.append(f"[{elem.get('emoji_type', 'emoji')}]")
+                # Other tags: silently skip
+            line = "".join(parts).strip()
+            if line:
+                lines.append(line)
+
+        content = "\n".join(lines)
+
+        # Strip bot @mentions
+        for bn in bot_mention_names:
+            content = content.replace(f"@{bn}", "").strip()
+
+        return content or "[post]", sender_name, image_keys
 
     def _extract_image_paths(self, text: str) -> tuple[str, list[str]]:
         """Extract image file paths from text, return (cleaned_text, paths)."""
@@ -728,7 +1751,16 @@ class FeishuChannel(BaseChannel):
                 seen.add(fpath)
             cleaned = cleaned.replace(m.group(0), "")
 
-        # 2. Bare paths / markdown image syntax
+        # 2. Full markdown image syntax: ![alt](file:///path) or ![alt](/path)
+        for m in self._MD_IMG_SYNTAX_RE.finditer(cleaned):
+            fpath = m.group(1)
+            if fpath not in seen and Path(fpath).is_file():
+                paths.append(fpath)
+                seen.add(fpath)
+            # Always remove the full syntax to avoid leftover ![...](...) text
+            cleaned = cleaned.replace(m.group(0), "")
+
+        # 3. Bare paths (no markdown syntax)
         for m in self._IMG_PATH_RE.finditer(cleaned):
             fpath = m.group(1)
             if fpath not in seen and Path(fpath).is_file():
@@ -876,38 +1908,160 @@ class FeishuChannel(BaseChannel):
             None, self._upload_audio_sync, file_path
         )
 
-    # ── outbound (send) ──
+    # ── image / file download (inbound multimodal) ──
+
+    _IMAGE_SUFFIXES = frozenset({
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
+    })
+    _TEXT_SUFFIXES = frozenset({
+        ".txt", ".csv", ".json", ".md", ".py", ".js", ".ts", ".html", ".css",
+        ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".log", ".sql",
+        ".sh", ".bash", ".go", ".rs", ".java", ".kt", ".swift", ".rb",
+        ".php", ".c", ".cpp", ".h", ".hpp", ".r", ".lua",
+    })
+    _MAX_FILE_READ_BYTES = 50 * 1024  # 50 KB
 
     @staticmethod
-    def _needs_card(text: str, has_images: bool, has_actions: bool) -> bool:
-        """Decide whether *text* is rich enough to warrant an interactive card.
+    def _detect_image_ext(data: bytes) -> str:
+        """Detect image format from magic bytes, return file extension."""
+        if data[:3] == b"\xff\xd8\xff":
+            return ".jpg"
+        if data[:4] == b"\x89PNG":
+            return ".png"
+        if data[:4] == b"GIF8":
+            return ".gif"
+        if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return ".webp"
+        if data[:2] == b"BM":
+            return ".bmp"
+        return ".png"  # fallback
 
-        Plain text messages look compact (no wide card chrome), so we prefer
-        them for short / simple chunks.  Use a card when:
-        - the chunk contains a markdown table
-        - the chunk will carry embedded images
-        - the chunk includes actionable buttons
-        - the chunk uses markdown features that benefit from card rendering
-          (bold, links, code blocks, bullet lists, etc.)
-        """
-        if has_images:
-            return True
-        if has_actions:
-            return True
-        # <at> mention tags only render properly in cards, not plain text
-        if "<at " in text:
-            return True
-        # Markdown table
-        if re.search(r"^\s*\|.+\|", text, re.MULTILINE):
-            return True
-        # Rich markdown: bold, italic, links, code blocks, bullet/numbered lists
-        if re.search(
-            r"\*\*.+?\*\*|__.*?__|`.+?`|```|\[.+?\]\(.+?\)|^[-*]\s|^\d+\.\s",
-            text,
-            re.MULTILINE,
-        ):
-            return True
-        return False
+    def _download_image_sync(
+        self, message_id: str, file_key: str,
+    ) -> str | None:
+        """Download an image resource from Lark, return local file path or None."""
+        try:
+            req = (
+                GetMessageResourceRequest.builder()
+                .message_id(message_id)
+                .file_key(file_key)
+                .type("image")
+                .build()
+            )
+            resp = self._client.im.v1.message_resource.get(req)
+
+            if not resp.success():
+                logger.warning(
+                    f"Image download failed: code={resp.code}, msg={resp.msg}"
+                )
+                return None
+
+            if not (hasattr(resp, "file") and resp.file):
+                logger.warning("Image download: resp.file is empty")
+                return None
+
+            data = resp.file.read()
+            if not data:
+                return None
+
+            ext = self._detect_image_ext(data)
+            image_dir = Path.home() / ".getall" / "media" / "images"
+            image_dir.mkdir(parents=True, exist_ok=True)
+            out_path = image_dir / f"feishu_{int(_time.time() * 1000)}{ext}"
+            out_path.write_bytes(data)
+
+            logger.debug(
+                f"Downloaded image: {message_id}/{file_key} → {out_path}"
+            )
+            return str(out_path)
+
+        except Exception as exc:
+            logger.warning(f"Error downloading image {file_key}: {exc}")
+            return None
+
+    async def _download_image(
+        self, message_id: str, file_key: str,
+    ) -> str | None:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, self._download_image_sync, message_id, file_key,
+        )
+
+    def _download_file_sync(
+        self, message_id: str, file_key: str, file_name: str,
+    ) -> str | None:
+        """Download a file resource from Lark, return local file path or None."""
+        try:
+            req = (
+                GetMessageResourceRequest.builder()
+                .message_id(message_id)
+                .file_key(file_key)
+                .type("file")
+                .build()
+            )
+            resp = self._client.im.v1.message_resource.get(req)
+
+            if not resp.success():
+                logger.warning(
+                    f"File download failed: code={resp.code}, msg={resp.msg}"
+                )
+                return None
+
+            if not (hasattr(resp, "file") and resp.file):
+                logger.warning("File download: resp.file is empty")
+                return None
+
+            data = resp.file.read()
+            if not data:
+                return None
+
+            file_dir = Path.home() / ".getall" / "media" / "files"
+            file_dir.mkdir(parents=True, exist_ok=True)
+            safe_name = re.sub(r"[^\w.\-]", "_", file_name)
+            safe_name = re.sub(r"\.{2,}", "_", safe_name)  # collapse ..
+            safe_name = safe_name.lstrip("._")  # no hidden files
+            safe_name = safe_name or "file"
+            out_path = file_dir / f"{int(_time.time() * 1000)}_{safe_name}"
+            out_path.write_bytes(data)
+
+            logger.debug(
+                f"Downloaded file: {message_id}/{file_key} → {out_path}"
+            )
+            return str(out_path)
+
+        except Exception as exc:
+            logger.warning(f"Error downloading file {file_key}: {exc}")
+            return None
+
+    async def _download_file(
+        self, message_id: str, file_key: str, file_name: str,
+    ) -> str | None:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, self._download_file_sync, message_id, file_key, file_name,
+        )
+
+    @classmethod
+    def _read_file_as_text(cls, file_path: str, file_name: str) -> str:
+        """Read file content for text-based files; return description for others."""
+        p = Path(file_path)
+        suffix = p.suffix.lower()
+        if suffix in cls._TEXT_SUFFIXES:
+            try:
+                raw = p.read_bytes()
+                if len(raw) > cls._MAX_FILE_READ_BYTES:
+                    text = raw[: cls._MAX_FILE_READ_BYTES].decode(
+                        "utf-8", errors="replace"
+                    )
+                    text += "\n...(truncated)"
+                else:
+                    text = raw.decode("utf-8", errors="replace")
+                return f"[file: {file_name}]\n```\n{text}\n```"
+            except Exception:
+                pass
+        return f"[file: {file_name}, saved: {file_path}]"
+
+    # ── outbound (send) ──
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Lark/Feishu.
@@ -979,19 +2133,50 @@ class FeishuChannel(BaseChannel):
 
             action_items = self._extract_card_actions(content, msg.metadata or {})
 
-            # Prepend @sender for group chats
+            # Event system: override card theme when a limited-time event is active.
+            event_card_theme = (msg.metadata or {}).get("event_card_theme", "")
+
+            sender_oid = ""
             if is_group:
                 sender_oid = (msg.metadata or {}).get("sender_open_id", "")
-                if sender_oid:
-                    content = self._prepend_sender_at(
-                        msg.chat_id, sender_oid, content
-                    )
+            source = str((msg.metadata or {}).get("source", "") or "").strip().lower()
 
-            # Send as ONE message: card if rich content, plain text otherwise.
-            if self._needs_card(
-                content, bool(image_paths), bool(action_items)
-            ):
-                elements = self._build_card_elements(content)
+            render_plan = await self._plan_render(
+                content=content,
+                chat_id=msg.chat_id,
+                is_group=is_group,
+                sender_open_id=sender_oid,
+                has_images=bool(image_paths),
+                has_actions=bool(action_items),
+                source=source,
+            )
+
+            if render_plan.mode == "interactive":
+                planned_body = (render_plan.body or content).strip()
+                planned_title = (render_plan.title or "").strip()
+
+                # Extract first heading only for card-title inference and to avoid
+                # duplicate visible titles in body.
+                inferred_title, template, body_wo_heading = self._extract_card_header(
+                    planned_body
+                )
+                title = planned_title or inferred_title
+                if inferred_title:
+                    body = body_wo_heading
+                else:
+                    body = planned_body
+
+                if render_plan.mention_sender and sender_oid:
+                    if f"<at id={sender_oid}>" not in body:
+                        body = self._prepend_sender_at(
+                            msg.chat_id, sender_oid, body
+                        )
+
+                # Keep event theme as the top-priority visual override.
+                if event_card_theme:
+                    template = event_card_theme
+
+                elements = self._build_card_elements(body)
                 for img_path in image_paths:
                     img_key = await self._upload_image(img_path)
                     if img_key:
@@ -1005,19 +2190,95 @@ class FeishuChannel(BaseChannel):
                         })
                 if action_items:
                     elements.append(self._build_action_element(action_items))
-                card = json.dumps(
-                    {"config": {"wide_screen_mode": True}, "elements": elements},
-                    ensure_ascii=False,
-                )
-                await self._send_msg(recv_type, msg.chat_id, "interactive", card)
+                card_data: dict[str, Any] = {
+                    "config": {"wide_screen_mode": True},
+                    "elements": elements,
+                }
+                if title:
+                    card_data["header"] = {
+                        "title": {"content": title, "tag": "plain_text"},
+                        "template": template,
+                    }
+                card = json.dumps(card_data, ensure_ascii=False)
+                try:
+                    await self._send_msg(recv_type, msg.chat_id, "interactive", card)
+                except RuntimeError as card_exc:
+                    if "table" in str(card_exc).lower() and (
+                        "over limit" in str(card_exc).lower()
+                        or "11310" in str(card_exc)
+                    ):
+                        # Card table limit hit — ask LLM to reformat with
+                        # fewer tables, then retry as a new card.
+                        logger.warning(
+                            "Card table limit exceeded, requesting LLM "
+                            f"reformat: {card_exc}"
+                        )
+                        reformatted = await self._reformat_for_card(body)
+                        r_title, r_tmpl, r_body = self._extract_card_header(
+                            reformatted
+                        )
+                        if (
+                            render_plan.mention_sender
+                            and sender_oid
+                            and f"<at id={sender_oid}>" not in r_body
+                        ):
+                            r_body = self._prepend_sender_at(
+                                msg.chat_id, sender_oid, r_body
+                            )
+                        if event_card_theme:
+                            r_tmpl = event_card_theme
+                        r_elems = self._build_card_elements(r_body)
+                        r_card_data: dict[str, Any] = {
+                            "config": {"wide_screen_mode": True},
+                            "elements": r_elems,
+                        }
+                        if r_title:
+                            r_card_data["header"] = {
+                                "title": {
+                                    "content": r_title,
+                                    "tag": "plain_text",
+                                },
+                                "template": r_tmpl,
+                            }
+                        r_card = json.dumps(r_card_data, ensure_ascii=False)
+                        try:
+                            await self._send_msg(
+                                recv_type, msg.chat_id, "interactive",
+                                r_card,
+                            )
+                        except Exception:
+                            # Last resort: plain text
+                            logger.warning(
+                                "Reformatted card also failed, sending "
+                                "plain text"
+                            )
+                            fb = reformatted
+                            if render_plan.mention_sender and sender_oid:
+                                fb = self._prepend_sender_plain(
+                                    msg.chat_id, sender_oid, fb
+                                )
+                            await self._send_msg(
+                                recv_type, msg.chat_id, "text",
+                                json.dumps(
+                                    {"text": fb}, ensure_ascii=False
+                                ),
+                            )
+                    else:
+                        raise
             else:
+                text_content = (render_plan.body or content).strip() or content
+                if render_plan.mention_sender and sender_oid:
+                    text_content = self._prepend_sender_plain(
+                        msg.chat_id, sender_oid, text_content
+                    )
                 text_body = json.dumps(
-                    {"text": content}, ensure_ascii=False
+                    {"text": text_content}, ensure_ascii=False
                 )
                 await self._send_msg(recv_type, msg.chat_id, "text", text_body)
 
         except Exception as exc:
             logger.error(f"Error sending Lark message: {exc}")
+            raise
 
     async def _send_msg(
         self, recv_type: str, recv_id: str, msg_type: str, content: str
@@ -1041,10 +2302,12 @@ class FeishuChannel(BaseChannel):
         )
 
         if not resp.success():
-            logger.error(
+            error_detail = (
                 f"Send failed: code={resp.code}, msg={resp.msg}, "
                 f"log_id={resp.get_log_id()}"
             )
+            logger.error(error_detail)
+            raise RuntimeError(error_detail)
         else:
             sent_mid = str(getattr(getattr(resp, "data", None), "message_id", "") or "")
             if sent_mid:
@@ -1089,6 +2352,7 @@ class FeishuChannel(BaseChannel):
             content = ""
             sender_name = sender_id
             audio_path: str | None = None
+            media_files: list[str] = []
 
             if msg_type == "text":
                 try:
@@ -1108,23 +2372,6 @@ class FeishuChannel(BaseChannel):
                         # Learn sender's display name
                         if oid == sender_id and mention.name:
                             sender_name = mention.name
-
-                        # Detect bot mention (sender_type won't tell us,
-                        # so we learn: if oid != sender and oid is unknown
-                        # to member cache, treat first such as bot)
-                        if (
-                            not self._bot_open_id
-                            and oid
-                            and oid != sender_id
-                            and mention.name
-                        ):
-                            # Heuristic: a non-sender mention that isn't
-                            # tracked as a human is likely the bot.
-                            if not self._members.resolve_name(
-                                chat_id, mention.name
-                            ):
-                                self._bot_open_id = oid
-                                logger.debug(f"Learned bot open_id: {oid}")
 
                         # Replace placeholder with display name
                         if mention.name:
@@ -1150,6 +2397,15 @@ class FeishuChannel(BaseChannel):
                     # Strip bot @mentions from content
                     for bn in bot_mention_names:
                         content = content.replace(f"@{bn}", "").strip()
+            elif msg_type == "post":
+                # ── Rich-text post: extract text + download embedded images ──
+                content, sender_name, post_image_keys = self._parse_post_content(
+                    message, sender_id, sender_name, chat_id, chat_type,
+                )
+                for ik in post_image_keys:
+                    img_path = await self._download_image(mid, ik)
+                    if img_path:
+                        media_files.append(img_path)
             elif msg_type == "audio":
                 # ── Voice message: download audio for STT ──
                 try:
@@ -1165,10 +2421,56 @@ class FeishuChannel(BaseChannel):
                 else:
                     content = "[audio]"
                     audio_path = None
+            elif msg_type == "image":
+                # ── Image: download for vision model ──
+                # Keep content="[image]" so session history records the image
+                # was sent; the actual pixels go via media → base64 → vision.
+                content = "[image]"
+                try:
+                    parsed = json.loads(message.content)
+                    image_key = parsed.get("image_key", "")
+                    if image_key:
+                        img_path = await self._download_image(mid, image_key)
+                        if img_path:
+                            media_files.append(img_path)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            elif msg_type == "sticker":
+                # ── Sticker: download as image for vision ──
+                content = "[sticker]"
+                try:
+                    parsed = json.loads(message.content)
+                    file_key = parsed.get("file_key", "")
+                    if file_key:
+                        img_path = await self._download_image(mid, file_key)
+                        if img_path:
+                            media_files.append(img_path)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            elif msg_type == "file":
+                # ── File: download and read/describe ──
+                content = "[file]"
+                try:
+                    parsed = json.loads(message.content)
+                    file_key = parsed.get("file_key", "")
+                    file_name = parsed.get("file_name", "unknown_file")
+                    if file_key:
+                        fpath = await self._download_file(
+                            mid, file_key, file_name
+                        )
+                        if fpath:
+                            suffix = Path(fpath).suffix.lower()
+                            if suffix in self._IMAGE_SUFFIXES:
+                                media_files.append(fpath)
+                                content = f"[file: {file_name}]"
+                            else:
+                                content = self._read_file_as_text(fpath, file_name)
+                except (json.JSONDecodeError, TypeError):
+                    pass
             else:
-                content = _MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]")
+                content = f"[{msg_type}]"
 
-            if not content and msg_type != "audio":
+            if not content and not media_files and msg_type != "audio":
                 return
 
             # ── group mention signal (used by agent-side reply policy) ──
@@ -1186,15 +2488,6 @@ class FeishuChannel(BaseChannel):
                         if self._bot_open_id and oid == self._bot_open_id:
                             bot_was_mentioned = True
                             break
-                        # Before we know bot_open_id, check if mention
-                        # is a non-sender, non-member (likely the bot)
-                        if (
-                            not self._bot_open_id
-                            and oid
-                            and oid != sender_id
-                        ):
-                            bot_was_mentioned = True
-                            break
 
                 self._members.track_sender(chat_id, sender_id, sender_name)
                 await self._ensure_members(chat_id)
@@ -1202,18 +2495,61 @@ class FeishuChannel(BaseChannel):
                 if resolved_sender_name and resolved_sender_name != sender_id:
                     sender_name = resolved_sender_name
 
+                # ── Record message for group stats (fire-and-forget) ──
+                try:
+                    from getall.stats.group_stats import get_stats_service
+                    await get_stats_service().record(
+                        chat_id=chat_id,
+                        sender_id=sender_id,
+                        sender_name=sender_name,
+                        bot_mentioned=bot_was_mentioned,
+                    )
+                except Exception:
+                    pass  # Stats are best-effort; never block message flow
+
                 # Group policy: process @mentions OR voice replies to bot.
                 if not bot_was_mentioned:
                     if not (is_voice_msg and reply_to_bot_thread):
+                        has_mentions = bool(message.mentions)
+                        if has_mentions:
+                            mention_ids = [
+                                (m.id.open_id if m.id else "?")
+                                for m in (message.mentions or [])
+                            ]
+                            logger.debug(
+                                f"Group message dropped (bot not mentioned). "
+                                f"bot_open_id={self._bot_open_id!r}, "
+                                f"mention_ids={mention_ids}"
+                            )
                         return
 
             # Seen indicator: keep it low-noise in groups (mention only)
             if chat_type != "group" or bot_was_mentioned or is_voice_msg:
+                # Check for active events to bias reaction emoji selection
+                event_hint = ""
+                try:
+                    from getall.events.manager import EventManager
+                    from getall.settings import get_settings
+                    settings = get_settings()
+                    workspace = Path(settings.workspace_dir).expanduser()
+                    _em = EventManager(workspace)
+                    _active = _em.get_active_events(
+                        message=content or "",
+                        user_id=sender_id,
+                        chat_id=chat_id,
+                    )
+                    if _active:
+                        event_hint = ", ".join(
+                            ae.config.name for ae in _active if not ae.is_game_phase
+                        )
+                except Exception:
+                    pass  # Non-critical — fall back to normal reaction
                 emoji_type = await self._choose_reaction_emoji(
                     message_id=mid,
                     msg_type=msg_type,
                     content=content or "(voice)",
                     chat_type=chat_type,
+                    event_hint=event_hint,
                 )
                 await self._add_reaction(mid, emoji_type)
 
@@ -1225,7 +2561,7 @@ class FeishuChannel(BaseChannel):
             )
             if member_names:
                 logger.debug(f"Passing {len(member_names)} member names to agent: {member_names}")
-            media: list[str] = []
+            media: list[str] = list(media_files)
             if audio_path:
                 media.append(audio_path)
             await self._handle_message(

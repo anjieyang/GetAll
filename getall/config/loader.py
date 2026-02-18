@@ -67,14 +67,19 @@ _ENV_PROVIDER_MAP: dict[str, str] = {
     "GETALL_DASHSCOPE_API_KEY": "dashscope",
     "GETALL_MOONSHOT_API_KEY": "moonshot",
     "GETALL_MINIMAX_API_KEY": "minimax",
+    "GETALL_VOLCENGINE_API_KEY": "volcengine",
     "GETALL_AIHUBMIX_API_KEY": "aihubmix",
     "GETALL_VLLM_API_KEY": "vllm",
+    "GETALL_CLOUDSWAY_API_KEY": "cloudsway",
 }
 
 _ENV_PROVIDER_BASE_MAP: dict[str, str] = {
     "GETALL_OPENAI_API_BASE": "openai",
     "GETALL_OPENROUTER_API_BASE": "openrouter",
     "GETALL_VLLM_API_BASE": "vllm",
+    "GETALL_CLOUDSWAY_API_BASE": "cloudsway",
+    "GETALL_VOLCENGINE_API_BASE": "volcengine",
+    "GETALL_MINIMAX_API_BASE": "minimax",
 }
 
 
@@ -159,9 +164,20 @@ def _apply_env_overrides(config: Config) -> None:
         except ValueError:
             pass
 
+    # --- Coinglass ---
+    if val := os.environ.get("GETALL_COINGLASS_API_KEY"):
+        config.trading.coinglass_api_key = val
+    if val := os.environ.get("GETALL_COINGLASS_BASE_URL"):
+        config.trading.coinglass_base_url = val
+
     # --- Gateway ---
     if val := os.environ.get("GETALL_GATEWAY_PORT"):
         config.gateway.port = int(val)
+
+    # --- Admin IFTs (comma-separated, bootstrapped on startup) ---
+    # Stored on config object for startup bootstrap; not a Pydantic field.
+    admin_ifts_raw = os.environ.get("GETALL_ADMIN_IFTS", "")
+    config._admin_ifts = [v.strip() for v in admin_ifts_raw.split(",") if v.strip()]
 
 
 def save_config(config: Config, config_path: Path | None = None) -> None:

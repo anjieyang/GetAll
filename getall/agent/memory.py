@@ -67,6 +67,69 @@ Rules:
         with open(self.history_file, "a", encoding="utf-8") as f:
             f.write(entry.rstrip() + "\n\n")
 
+    @property
+    def is_group_scope(self) -> bool:
+        return self.scope.startswith("group")
+
+    def read_recent_history(
+        self,
+        max_entries: int | None = None,
+        max_chars: int | None = None,
+    ) -> str:
+        """Return the most recent consolidation entries from HISTORY.md.
+
+        Each entry is separated by a blank line.  We read from the end
+        of the file and return up to *max_entries* entries (capped at
+        *max_chars* total characters) so the agent has actionable
+        context about recent conversations without needing to grep.
+
+        Group scopes get significantly larger defaults so the agent
+        retains rich per-user context across many speakers.
+        """
+        if max_entries is None:
+            max_entries = 12 if self.is_group_scope else 5
+        if max_chars is None:
+            max_chars = 8000 if self.is_group_scope else 3000
+        if not self.history_file.exists():
+            return ""
+        try:
+            raw = self.history_file.read_text(encoding="utf-8").rstrip()
+        except Exception:
+            return ""
+        if not raw:
+            return ""
+
+        # Entries are separated by double-newline
+        entries = [e.strip() for e in raw.split("\n\n") if e.strip()]
+        if not entries:
+            return ""
+
+        recent = entries[-max_entries:]
+        # Trim to max_chars from the *end* (newest first)
+        result_parts: list[str] = []
+        total = 0
+        for entry in reversed(recent):
+            if total + len(entry) > max_chars:
+                break
+            result_parts.append(entry)
+            total += len(entry)
+        result_parts.reverse()
+        return "\n\n".join(result_parts)
+
     def get_memory_context(self) -> str:
+        parts: list[str] = []
+
         long_term = self.read_long_term()
-        return f"## Long-term Memory\n{long_term}" if long_term else ""
+        if long_term:
+            parts.append(f"## Long-term Memory\n{long_term}")
+
+        recent_history = self.read_recent_history()
+        if recent_history:
+            parts.append(
+                f"## Recent Conversation History (auto-loaded)\n"
+                f"These are the most recent conversation summaries. "
+                f"For older history, grep the HISTORY.md file.\n\n"
+                f"{recent_history}"
+            )
+
+        return "\n\n".join(parts)

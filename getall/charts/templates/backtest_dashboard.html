@@ -1,0 +1,517 @@
+{% extends "base.html" %}
+
+{% block head_extra %}
+<style>
+  body {
+    padding: 20px;
+    min-height: 100vh;
+  }
+
+  /* ── Header ──────────────────────────────────────── */
+  .dashboard-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 16px;
+    padding-bottom: 14px;
+    border-bottom: 1px solid var(--border-color);
+  }
+  .dashboard-header h1 {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--text-primary);
+    letter-spacing: -0.01em;
+  }
+  .dashboard-header .subtitle {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-top: 2px;
+  }
+  .header-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 13px;
+    font-weight: 600;
+    font-family: var(--font-mono);
+  }
+  .header-badge.positive { background: var(--green-dim); color: var(--green); }
+  .header-badge.negative { background: var(--red-dim); color: var(--red); }
+
+  /* ── Grid layout ─────────────────────────────────── */
+  .dashboard-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    grid-template-rows: auto auto auto;
+    gap: 12px;
+  }
+  .bottom-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+
+  /* ── Equity panel ────────────────────────────────── */
+  #equity-chart  { height: 350px; }
+  #dd-chart      { height: 170px; }
+  #heatmap-chart { height: 260px; }
+
+  /* ── Metrics card ────────────────────────────────── */
+  .metrics-card { padding: 16px 20px; }
+  .metrics-section { margin-bottom: 14px; }
+  .metrics-section:last-child { margin-bottom: 0; }
+  .metrics-section-title {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    margin-bottom: 8px;
+    padding-bottom: 5px;
+    border-bottom: 1px solid var(--border-color);
+  }
+  .metrics-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    padding: 2px 0;
+  }
+  .metrics-row .label {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+  .metrics-row .value {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-primary);
+  }
+</style>
+{% endblock %}
+
+{% block body %}
+<div class="dashboard-header">
+  <div>
+    <h1 id="title">Backtest Dashboard</h1>
+    <div class="subtitle" id="subtitle"></div>
+  </div>
+  <div>
+    <span class="header-badge" id="returnBadge"></span>
+  </div>
+</div>
+
+<div class="dashboard-grid">
+  <!-- Equity curve -->
+  <div class="card">
+    <div class="card-header">Equity Curve</div>
+    <div id="equity-chart" class="chart-container"></div>
+  </div>
+
+  <!-- Drawdown -->
+  <div class="card">
+    <div class="card-header">Drawdown</div>
+    <div id="dd-chart" class="chart-container"></div>
+  </div>
+
+  <!-- Bottom row: heatmap + metrics -->
+  <div class="bottom-row">
+    <div class="card">
+      <div class="card-header">Monthly P&L</div>
+      <div id="heatmap-chart" class="chart-container"></div>
+    </div>
+    <div class="card metrics-card" id="metrics-panel">
+      <!-- filled by JS -->
+    </div>
+  </div>
+</div>
+
+<script>
+(function() {
+  try {
+  var D = JSON.parse({{ data_json | tojson }});
+
+  // ── Header ──────────────────────────────────────
+  var stratName = D.strategy_name || 'Strategy';
+  var symCount  = D.symbols_count || 1;
+  var suffix    = symCount > 1 ? ' (' + symCount + ' symbols)' : '';
+  document.getElementById('title').textContent = stratName + suffix;
+  document.getElementById('subtitle').textContent =
+    (D.period_start || '') + '  \u2192  ' + (D.period_end || '');
+
+  var totalRet = parseFloat(D.total_return_pct || 0);
+  var badge = document.getElementById('returnBadge');
+  badge.textContent = (totalRet >= 0 ? '+' : '') + totalRet.toFixed(2) + '%';
+  badge.className = 'header-badge ' + (totalRet >= 0 ? 'positive' : 'negative');
+
+  // ── Data prep ───────────────────────────────────
+  var curve = D.equity_curve || D._equity_curve || [];
+  var benchCurve = D.benchmark_curve || D._benchmark_curve || [];
+  var monthlyPnl = D.monthly_pnl || {};
+  var startVal = parseFloat(D.starting_balance || (curve.length ? curve[0].v : 0));
+
+  var timestamps  = curve.map(function(p) { return p.t; });
+  var equityVals  = curve.map(function(p) { return parseFloat(p.v); });
+
+  // Peak & drawdown
+  var peak = [], dd = [];
+  var curPeak = -Infinity;
+  for (var i = 0; i < equityVals.length; i++) {
+    curPeak = Math.max(curPeak, equityVals[i]);
+    peak.push(curPeak);
+    dd.push(curPeak > 0 ? ((equityVals[i] / curPeak) - 1) * 100 : 0);
+  }
+
+  // ── Helper: show "no data" placeholder in a chart container ──
+  function showEmpty(el, msg) {
+    try {
+      var c = echarts.init(el, 'getall_dark');
+      c.setOption({
+        graphic: [{
+          type: 'text', left: 'center', top: 'center',
+          style: { text: msg || 'No data', fontSize: 13, fill: '#636c76' }
+        }]
+      });
+    } catch(e) {
+      el.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#636c76;font-size:13px">' + (msg || 'No data') + '</div>';
+    }
+  }
+
+  // ── Panel 1: Equity ─────────────────────────────
+  try {
+  if (equityVals.length === 0) {
+    showEmpty(document.getElementById('equity-chart'), 'No equity data (0 trades)');
+  } else {
+  var eqChart = echarts.init(document.getElementById('equity-chart'), 'getall_dark');
+  var eqSeries = [
+    {
+      name: 'Strategy',
+      type: 'line',
+      data: equityVals,
+      symbol: 'none',
+      lineStyle: { width: 2, color: '#4C9AFF' },
+      areaStyle: {
+        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+          { offset: 0, color: 'rgba(76,154,255,0.25)' },
+          { offset: 1, color: 'rgba(76,154,255,0.02)' }
+        ])
+      },
+      z: 3
+    },
+    {
+      name: 'Peak',
+      type: 'line',
+      data: peak,
+      symbol: 'none',
+      lineStyle: { width: 1, color: '#3d444d', type: 'dashed' },
+      z: 1
+    }
+  ];
+
+  // Benchmark
+  if (benchCurve.length > 0) {
+    eqSeries.push({
+      name: 'Buy & Hold',
+      type: 'line',
+      data: benchCurve.map(function(p) { return parseFloat(p.v); }),
+      symbol: 'none',
+      lineStyle: { width: 1.5, color: '#F0B90B', type: 'dashed' },
+      z: 2
+    });
+  }
+
+  // Start-value reference line
+  var markLine = {
+    silent: true,
+    symbol: 'none',
+    lineStyle: { color: '#3d444d', type: 'dotted', width: 1 },
+    data: [{ yAxis: startVal, label: { show: false } }]
+  };
+  eqSeries[0].markLine = markLine;
+
+  // Max-drawdown marker
+  var worstDDIdx = 0, worstDD = 0;
+  for (var j = 0; j < dd.length; j++) {
+    if (dd[j] < worstDD) { worstDD = dd[j]; worstDDIdx = j; }
+  }
+  if (worstDD < 0) {
+    eqSeries[0].markPoint = {
+      symbol: 'circle',
+      symbolSize: 8,
+      itemStyle: { color: '#FF3B69' },
+      label: {
+        show: true,
+        formatter: 'Max DD ' + worstDD.toFixed(1) + '%',
+        position: 'bottom',
+        fontSize: 10,
+        color: '#FF3B69',
+        backgroundColor: 'rgba(255,59,105,0.12)',
+        borderRadius: 3,
+        padding: [3, 6]
+      },
+      data: [{ coord: [worstDDIdx, equityVals[worstDDIdx]] }]
+    };
+  }
+
+  eqChart.setOption({
+    grid: { left: 60, right: 20, top: 16, bottom: 30 },
+    xAxis: {
+      type: 'category',
+      data: timestamps,
+      axisLabel: { fontSize: 10, interval: Math.max(1, Math.floor(timestamps.length / 8)) },
+      boundaryGap: false
+    },
+    yAxis: {
+      type: 'value',
+      axisLabel: { fontSize: 10, formatter: function(v) { return v >= 1e6 ? (v/1e6).toFixed(1)+'M' : v >= 1e3 ? (v/1e3).toFixed(1)+'K' : v.toFixed(0); } },
+      splitNumber: 5
+    },
+    tooltip: {
+      trigger: 'axis',
+      axisPointer: { type: 'cross', crossStyle: { color: '#3d444d' } },
+      formatter: function(params) {
+        var t = params[0].axisValue;
+        var lines = ['<b>' + t + '</b>'];
+        params.forEach(function(p) {
+          lines.push('<span style="color:' + p.color + '">\u25CF</span> ' + p.seriesName + ': <b>' + parseFloat(p.value).toLocaleString(undefined, {maximumFractionDigits:2}) + '</b>');
+        });
+        return lines.join('<br>');
+      }
+    },
+    legend: {
+      data: eqSeries.map(function(s) { return s.name; }),
+      top: 0, right: 8,
+      textStyle: { fontSize: 10, color: '#8b949e' },
+      icon: 'roundRect', itemWidth: 12, itemHeight: 3
+    },
+    series: eqSeries
+  });
+  } // end if equityVals.length > 0
+  } catch(e) { console.error('Equity chart error:', e); showEmpty(document.getElementById('equity-chart'), 'Chart error'); }
+
+  // ── Panel 2: Drawdown ───────────────────────────
+  try {
+  if (dd.length === 0) {
+    showEmpty(document.getElementById('dd-chart'), 'No drawdown data');
+  } else {
+  var ddChart = echarts.init(document.getElementById('dd-chart'), 'getall_dark');
+  ddChart.setOption({
+    grid: { left: 60, right: 20, top: 10, bottom: 28 },
+    xAxis: {
+      type: 'category',
+      data: timestamps,
+      axisLabel: { fontSize: 10, interval: Math.max(1, Math.floor(timestamps.length / 8)) },
+      boundaryGap: false
+    },
+    yAxis: {
+      type: 'value',
+      axisLabel: { fontSize: 10, formatter: '{value}%' },
+      max: 0,
+      splitNumber: 3
+    },
+    tooltip: {
+      trigger: 'axis',
+      formatter: function(params) {
+        return '<b>' + params[0].axisValue + '</b><br>Drawdown: <b style="color:#FF3B69">' + parseFloat(params[0].value).toFixed(2) + '%</b>';
+      }
+    },
+    series: [{
+      type: 'line',
+      data: dd,
+      symbol: 'none',
+      lineStyle: { width: 1, color: '#FF3B69' },
+      areaStyle: {
+        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+          { offset: 0, color: 'rgba(255,59,105,0.35)' },
+          { offset: 1, color: 'rgba(255,59,105,0.05)' }
+        ])
+      }
+    }]
+  });
+  } // end if dd.length > 0
+  } catch(e) { console.error('Drawdown chart error:', e); showEmpty(document.getElementById('dd-chart'), 'Chart error'); }
+
+  // ── Panel 3: Monthly heatmap ────────────────────
+  try {
+  var heatChart = echarts.init(document.getElementById('heatmap-chart'), 'getall_dark');
+  var monthKeys = Object.keys(monthlyPnl).sort();
+
+  if (monthKeys.length > 0) {
+    // Build pivot: years (rows) x months (cols)
+    var yearSet = {}, yearArr = [];
+    monthKeys.forEach(function(k) {
+      var y = k.substring(0, 4);
+      if (!yearSet[y]) { yearSet[y] = true; yearArr.push(y); }
+    });
+    yearArr.sort();
+
+    var heatData = [];
+    var absMax = 0;
+    yearArr.forEach(function(y, yi) {
+      for (var m = 1; m <= 12; m++) {
+        var key = y + '-' + String(m).padStart(2, '0');
+        var val = monthlyPnl[key];
+        if (val !== undefined && val !== null) {
+          var fv = parseFloat(val);
+          heatData.push([m - 1, yi, fv]);
+          absMax = Math.max(absMax, Math.abs(fv));
+        } else {
+          heatData.push([m - 1, yi, '-']);
+        }
+      }
+    });
+    absMax = Math.max(absMax, 1);
+
+    var monthLabels = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+    heatChart.setOption({
+      grid: { left: 50, right: 60, top: 8, bottom: 24 },
+      xAxis: {
+        type: 'category',
+        data: monthLabels,
+        splitArea: { show: true, areaStyle: { color: ['transparent', 'rgba(255,255,255,0.01)'] } },
+        axisLabel: { fontSize: 10 }
+      },
+      yAxis: {
+        type: 'category',
+        data: yearArr,
+        axisLabel: { fontSize: 10 }
+      },
+      visualMap: {
+        min: -absMax,
+        max: absMax,
+        calculable: false,
+        orient: 'vertical',
+        right: 4,
+        top: 'center',
+        itemHeight: 120,
+        inRange: {
+          color: ['#FF3B69', '#FF3B69CC', '#3d444d', '#00C076CC', '#00C076']
+        },
+        textStyle: { color: '#8b949e', fontSize: 9 },
+        formatter: function(v) { return v.toFixed(0); }
+      },
+      tooltip: {
+        formatter: function(p) {
+          if (p.value[2] === '-') return 'No data';
+          return '<b>' + yearArr[p.value[1]] + ' ' + monthLabels[p.value[0]] + '</b><br>P&L: <b>' + parseFloat(p.value[2]).toFixed(1) + '</b>';
+        }
+      },
+      series: [{
+        type: 'heatmap',
+        data: heatData,
+        label: {
+          show: true,
+          fontSize: 9,
+          fontFamily: "'JetBrains Mono', monospace",
+          formatter: function(p) {
+            if (p.value[2] === '-') return '';
+            return parseFloat(p.value[2]).toFixed(0);
+          },
+          color: '#e6edf3'
+        },
+        itemStyle: {
+          borderColor: '#0f1117',
+          borderWidth: 2,
+          borderRadius: 3
+        },
+        emphasis: {
+          itemStyle: { shadowBlur: 6, shadowColor: 'rgba(0,0,0,0.5)' }
+        }
+      }]
+    });
+  } else {
+    heatChart.setOption({
+      graphic: [{
+        type: 'text',
+        left: 'center',
+        top: 'center',
+        style: { text: 'No monthly data', fontSize: 13, fill: '#636c76' }
+      }]
+    });
+  }
+  } catch(e) { console.error('Heatmap chart error:', e); showEmpty(document.getElementById('heatmap-chart'), 'Chart error'); }
+
+  // ── Panel 4: Metrics card ───────────────────────
+  try {
+  function fmt(v, decimals, suffix) {
+    if (v === null || v === undefined || v === 'N/A') return 'N/A';
+    var n = parseFloat(v);
+    if (isNaN(n)) return String(v);
+    var s = suffix || '';
+    return (n >= 0 ? '+' : '') + n.toFixed(decimals === undefined ? 2 : decimals) + s;
+  }
+  function fmtUnsigned(v, decimals, suffix) {
+    if (v === null || v === undefined || v === 'N/A') return 'N/A';
+    var n = parseFloat(v);
+    if (isNaN(n)) return String(v);
+    return n.toFixed(decimals === undefined ? 2 : decimals) + (suffix || '');
+  }
+  function colorClass(v) {
+    var n = parseFloat(v);
+    if (isNaN(n)) return '';
+    return n > 0 ? 'positive' : n < 0 ? 'negative' : '';
+  }
+
+  var pfVal = parseFloat(D.profit_factor || 0);
+  var pfText = pfVal >= 100 ? '\u221E' : fmtUnsigned(pfVal, 2);
+
+  var sections = [
+    {
+      title: 'Performance',
+      rows: [
+        ['Total Return', fmt(D.total_return_pct, 2, '%'), colorClass(D.total_return_pct)],
+        ['Annualized', fmt(D.annualized_return_pct, 2, '%'), colorClass(D.annualized_return_pct)],
+        ['Net Profit', fmt(D.net_profit, 0), colorClass(D.net_profit)],
+        ['Benchmark Ret', fmt(D.benchmark_return_pct, 2, '%'), colorClass(D.benchmark_return_pct)],
+        ['Excess Return', fmt(D.excess_return_pct, 2, '%'), colorClass(D.excess_return_pct)]
+      ]
+    },
+    {
+      title: 'Risk',
+      rows: [
+        ['Max Drawdown', fmtUnsigned(D.max_drawdown_pct, 2, '%'), 'negative'],
+        ['DD Duration', fmtUnsigned(D.max_drawdown_duration_days, 0, 'd'), ''],
+        ['Sharpe', fmtUnsigned(D.sharpe_ratio, 2), colorClass(D.sharpe_ratio)],
+        ['Sortino', fmtUnsigned(D.sortino_ratio, 2), colorClass(D.sortino_ratio)],
+        ['Calmar', fmtUnsigned(D.calmar_ratio, 2), colorClass(D.calmar_ratio)]
+      ]
+    },
+    {
+      title: 'Trades',
+      rows: [
+        ['Total', String(D.total_trades || 0), ''],
+        ['Win Rate', fmtUnsigned(D.win_rate_pct, 1, '%'), ''],
+        ['Profit Factor', pfText, ''],
+        ['Payoff Ratio', fmtUnsigned(D.payoff_ratio, 2), ''],
+        ['Expectancy', fmtUnsigned(D.expectancy, 4), colorClass(D.expectancy)],
+        ['Avg Hold', String(D.avg_hold_time || 'N/A'), ''],
+        ['Max Consec Loss', String(D.max_consecutive_losses || 'N/A'), '']
+      ]
+    }
+  ];
+
+  var html = '';
+  sections.forEach(function(sec) {
+    html += '<div class="metrics-section">';
+    html += '<div class="metrics-section-title">' + sec.title + '</div>';
+    sec.rows.forEach(function(row) {
+      html += '<div class="metrics-row">';
+      html += '  <span class="label">' + row[0] + '</span>';
+      html += '  <span class="value ' + row[2] + '">' + row[1] + '</span>';
+      html += '</div>';
+    });
+    html += '</div>';
+  });
+  document.getElementById('metrics-panel').innerHTML = html;
+  } catch(e) { console.error('Metrics panel error:', e); }
+
+  } catch(e) { console.error('Dashboard fatal error:', e); }
+
+  // ── Signal ready ────────────────────────────────
+  // ALWAYS signal ready, even if charts failed — prevents 15s timeout hang
+  setTimeout(signalReady, 300);
+})();
+</script>
+{% endblock %}

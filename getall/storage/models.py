@@ -80,6 +80,7 @@ class Principal(Base):
     ift: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     agent_identity_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
     status: Mapped[str] = mapped_column(String(32), default="active")
+    role: Mapped[str] = mapped_column(String(32), default="user", index=True)  # "user" | "admin"
     delegation_policy_text: Mapped[str] = mapped_column(Text, default="")
 
     # ── per-user pet persona (all NL, no enums) ──
@@ -300,6 +301,34 @@ class EvolutionEvent(Base):
 
 
 # ---------------------------------------------------------------------------
+# LLM usage tracking
+# ---------------------------------------------------------------------------
+
+
+class LLMUsageRecord(Base):
+    """Per-call LLM token usage and cost tracking."""
+    __tablename__ = "llm_usage_records"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(String(64), default="default", index=True)
+    principal_id: Mapped[str] = mapped_column(String(36), default="", index=True)
+    session_key: Mapped[str] = mapped_column(String(512), default="")
+    model: Mapped[str] = mapped_column(String(128), index=True)
+    provider: Mapped[str] = mapped_column(String(64), default="")  # e.g. "cloudsway", "openrouter"
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cost_usd: Mapped[str] = mapped_column(String(32), default="0")  # string to avoid float precision issues
+    call_type: Mapped[str] = mapped_column(String(32), default="chat")  # chat / consolidation / subagent
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, index=True)
+
+    __table_args__ = (
+        Index("ix_usage_principal_created", "principal_id", "created_at"),
+        Index("ix_usage_model_created", "model", "created_at"),
+    )
+
+
+# ---------------------------------------------------------------------------
 # audit
 # ---------------------------------------------------------------------------
 
@@ -316,3 +345,53 @@ class AuditEvent(Base):
     severity: Mapped[str] = mapped_column(String(16), default="info")
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, index=True)
+
+
+# ---------------------------------------------------------------------------
+# system config (key-value store for runtime settings)
+# ---------------------------------------------------------------------------
+
+
+class SystemConfig(Base):
+    __tablename__ = "system_config"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+    updated_by: Mapped[str] = mapped_column(String(36), default="")  # principal_id of who changed it
+
+
+# ---------------------------------------------------------------------------
+# feedback / bug reports
+# ---------------------------------------------------------------------------
+
+
+class FeedbackStatus(str, PyEnum):
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    RESOLVED = "resolved"
+    WONT_FIX = "wont_fix"
+
+
+class FeedbackSource(str, PyEnum):
+    USER = "user"
+    AGENT = "agent"
+
+
+class Feedback(Base):
+    __tablename__ = "feedback"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    principal_id: Mapped[str] = mapped_column(ForeignKey("principals.id"), index=True)
+    source: Mapped[FeedbackSource] = mapped_column(SqlEnum(FeedbackSource))
+    category: Mapped[str] = mapped_column(String(32), index=True)  # bug / suggestion / complaint
+    summary: Mapped[str] = mapped_column(String(512))
+    detail: Mapped[str] = mapped_column(Text, default="")
+    session_key: Mapped[str] = mapped_column(String(255), default="")
+    status: Mapped[FeedbackStatus] = mapped_column(
+        SqlEnum(FeedbackStatus), default=FeedbackStatus.PENDING, index=True,
+    )
+    resolution_note: Mapped[str] = mapped_column(Text, default="")
+    resolved_by: Mapped[str] = mapped_column(String(36), default="")  # admin principal_id
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)

@@ -21,6 +21,8 @@ class LLMResponse:
     finish_reason: str = "stop"
     usage: dict[str, int] = field(default_factory=dict)
     reasoning_content: str | None = None  # Kimi, DeepSeek-R1 etc.
+    cost_usd: float = 0.0  # Estimated cost in USD (from litellm.completion_cost)
+    model: str = ""  # Resolved model name used for this call
     
     @property
     def has_tool_calls(self) -> bool:

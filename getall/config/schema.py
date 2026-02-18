@@ -5,6 +5,31 @@ from pydantic import BaseModel, Field, ConfigDict
 from pydantic_settings import BaseSettings
 
 
+# ---------------------------------------------------------------------------
+# Allowed models for runtime switching (admin-controlled)
+# ---------------------------------------------------------------------------
+
+ALLOWED_MODELS: dict[str, str] = {
+    "MaaS_Cl_Sonnet_4.5": "Claude 4.5 Sonnet",
+    "gpt-5.2-codex": "GPT 5.2 Codex",
+    "kimi-k2-5-260127": "Kimi K2.5 (Volcengine)",
+    "MiniMax-M2.5-highspeed": "MiniMax M2.5 Highspeed",
+}
+"""Model ID → display name. Only these can be selected at runtime."""
+
+# Models known to support vision (image_url in user messages).
+# Models NOT in this set will be auto-swapped to VISION_FALLBACK_MODEL
+# when the user sends images/media requiring multimodal understanding.
+VISION_CAPABLE_MODELS: frozenset[str] = frozenset({
+    "MaaS_Cl_Sonnet_4.5",
+    "kimi-k2-5-260127",
+    "MiniMax-M2.5-highspeed",
+})
+
+VISION_FALLBACK_MODEL: str = "MaaS_Cl_Sonnet_4.5"
+"""Fallback model used when the active model lacks vision and user sends images."""
+
+
 class WhatsAppConfig(BaseModel):
     """WhatsApp channel configuration."""
     enabled: bool = False
@@ -31,6 +56,7 @@ class FeishuConfig(BaseModel):
     allow_from: list[str] = Field(default_factory=list)  # Allowed user open_ids
     use_webhook: bool = False  # If true, use HTTP webhook instead of WebSocket
     group_mode: str = "shared"  # "shared" = all group messages use one session
+    notification_chat_ids: list[str] = Field(default_factory=list)  # Group chat_ids for lifecycle notifications (online/offline)
 
 
 class DingTalkConfig(BaseModel):
@@ -160,7 +186,7 @@ class ChannelsConfig(BaseModel):
 class AgentDefaults(BaseModel):
     """Default agent configuration."""
     workspace: str = "~/.getall/workspace"
-    model: str = "anthropic/claude-opus-4-5"
+    model: str = ""  # Set via GETALL_MODEL in .env
     max_tokens: int = 65536
     max_concurrent_workers: int = 8
     temperature: float = 0.7
@@ -194,7 +220,9 @@ class ProvidersConfig(BaseModel):
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
     moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
     minimax: ProviderConfig = Field(default_factory=ProviderConfig)
+    volcengine: ProviderConfig = Field(default_factory=ProviderConfig)  # 火山引擎 Ark (BytePlus)
     aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway
+    cloudsway: ProviderConfig = Field(default_factory=ProviderConfig)  # CloudsWay MaaS gateway
 
 
 class GatewayConfig(BaseModel):
@@ -257,8 +285,9 @@ class TradingConfig(BaseModel):
     ws_reconnect_delay: int = 5
     ws_reconnect_max_delay: int = 60
 
-    # Coinglass proxy
-    coinglass_base_url: str = "http://18.176.51.231:5000"
+    # Coinglass API (direct)
+    coinglass_base_url: str = "https://open-api-v4.coinglass.com/api"
+    coinglass_api_key: str = ""
 
     # Followin API
     followin_base_url: str = "https://api.followin.io"
@@ -319,17 +348,19 @@ class Config(BaseSettings):
         return p.api_key if p else None
     
     def get_api_base(self, model: str | None = None) -> str | None:
-        """Get API base URL for the given model. Applies default URLs for known gateways."""
+        """Get API base URL for the given model.
+
+        Priority:
+          1. Explicit api_base from provider config (env var or config.json).
+          2. default_api_base from the registry spec (gateways & standard providers).
+        """
         from getall.providers.registry import find_by_name
         p, name = self._match_provider(model)
         if p and p.api_base:
             return p.api_base
-        # Only gateways get a default api_base here. Standard providers
-        # (like Moonshot) set their base URL via env vars in _setup_env
-        # to avoid polluting the global litellm.api_base.
         if name:
             spec = find_by_name(name)
-            if spec and spec.is_gateway and spec.default_api_base:
+            if spec and spec.default_api_base:
                 return spec.default_api_base
         return None
     

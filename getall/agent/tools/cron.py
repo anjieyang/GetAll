@@ -1,12 +1,24 @@
 """Reminders tool backed by cron scheduling."""
 
+from __future__ import annotations
+
+import asyncio
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
+
+from loguru import logger
 
 from getall.agent.tools.base import Tool
+from getall.bus.events import OutboundMessage
 from getall.cron.service import CronService
 from getall.cron.types import CronSchedule
+
+# Type for the heartbeat factory set by the agent loop.
+# (delay_seconds, message) -> heartbeat_id
+HeartbeatFactory = Callable[[int, str], str]
+# (heartbeat_id) -> bool
+HeartbeatCanceller = Callable[[str], bool]
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +44,23 @@ class ReminderTool(Tool):
             "reminder_tool_context",
             default=_ReminderContext(),
         )
+        # Task-scoped heartbeat callbacks (set by AgentLoop per processing cycle)
+        self._heartbeat_factory: HeartbeatFactory | None = None
+        self._heartbeat_canceller: HeartbeatCanceller | None = None
+
+    def set_heartbeat_callbacks(
+        self,
+        factory: HeartbeatFactory,
+        canceller: HeartbeatCanceller,
+    ) -> None:
+        """Set task-scoped heartbeat callbacks (called by AgentLoop)."""
+        self._heartbeat_factory = factory
+        self._heartbeat_canceller = canceller
+
+    def clear_heartbeat_callbacks(self) -> None:
+        """Clear heartbeat callbacks after task processing ends."""
+        self._heartbeat_factory = None
+        self._heartbeat_canceller = None
     
     def set_context(
         self,
@@ -78,7 +107,14 @@ class ReminderTool(Tool):
             "For finite loops, set max_runs (e.g. every_seconds=1, max_runs=10). "
             "IMPORTANT: if the user gives a clear scheduling instruction, create it immediately "
             "and report the created job id; do NOT ask for extra confirmation like 'reply start'. "
-            "The reminder runs in the current chat context and starts automatically after creation."
+            "The reminder runs in the current chat context and starts automatically after creation. "
+            "\n\n"
+            "**Task-scoped heartbeat**: When you are about to execute a long-running tool "
+            "(e.g. backtest, large data fetch), set task_scoped=true with delay_seconds to "
+            "schedule a progress message. It fires once after delay_seconds if the task is "
+            "still running, then auto-cancels when the current task completes. "
+            "Use this to keep the user informed during long operations — decide the message "
+            "and timing yourself based on estimated duration."
         )
     
     @property
@@ -124,9 +160,28 @@ class ReminderTool(Tool):
                 },
                 "mode": {
                     "type": "string",
-                    "enum": ["direct", "agent"],
-                    "description": "direct: send text as-is; agent: run an LLM turn each trigger",
-                    "default": "direct",
+                    "enum": ["agent", "direct"],
+                    "description": "agent (default): run a full LLM turn each trigger to generate content; "
+                    "direct: send the message text verbatim without LLM processing "
+                    "(only for simple static reminders like '该喝水了')",
+                    "default": "agent",
+                },
+                "task_scoped": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, creates a lightweight heartbeat that auto-cancels "
+                        "when the current task finishes. Use with delay_seconds. "
+                        "For keeping users informed during long-running operations."
+                    ),
+                    "default": False,
+                },
+                "delay_seconds": {
+                    "type": "integer",
+                    "description": (
+                        "Seconds to wait before sending the heartbeat message. "
+                        "Only used with task_scoped=true."
+                    ),
+                    "minimum": 5,
                 },
             },
             "required": [],
@@ -143,6 +198,8 @@ class ReminderTool(Tool):
         max_runs: int | None = None,
         final_message: str | None = None,
         mode: str = "direct",
+        task_scoped: bool = False,
+        delay_seconds: int | None = None,
         **kwargs: Any
     ) -> str:
         inferred_action = (action or "").strip().lower()
@@ -152,6 +209,12 @@ class ReminderTool(Tool):
             else:
                 inferred_action = "add"
 
+        # ── Task-scoped heartbeat (lightweight, auto-cancelled) ──
+        if task_scoped and inferred_action == "add":
+            return self._add_heartbeat(message, delay_seconds)
+        if inferred_action in {"remove", "delete"} and job_id and job_id.startswith("hb_"):
+            return self._remove_heartbeat(job_id)
+
         if inferred_action == "add":
             return self._add_job(message, every_seconds, cron_expr, at, max_runs, final_message, mode)
         elif inferred_action == "list":
@@ -159,6 +222,35 @@ class ReminderTool(Tool):
         elif inferred_action in {"remove", "delete"}:
             return self._remove_job(job_id)
         return f"Error: unknown action '{inferred_action}'"
+
+    # ── Task-scoped heartbeat helpers ──
+
+    def _add_heartbeat(self, message: str, delay_seconds: int | None) -> str:
+        """Schedule a task-scoped heartbeat via the agent loop callback."""
+        if not message:
+            return "Error: message is required for heartbeat"
+        if not self._heartbeat_factory:
+            return "Error: task-scoped heartbeats not available in this context"
+        delay = delay_seconds or 30
+        try:
+            hb_id = self._heartbeat_factory(delay, message)
+            logger.info(f"Task heartbeat scheduled: {hb_id} in {delay}s")
+            return (
+                f"Heartbeat scheduled (id: {hb_id}): will send \"{message}\" "
+                f"in {delay}s if the task is still running. "
+                f"Auto-cancels when the current task completes."
+            )
+        except Exception as e:
+            logger.error(f"Failed to schedule heartbeat: {e}")
+            return f"Error scheduling heartbeat: {e}"
+
+    def _remove_heartbeat(self, hb_id: str) -> str:
+        """Cancel a task-scoped heartbeat."""
+        if not self._heartbeat_canceller:
+            return f"Error: heartbeat cancellation not available"
+        if self._heartbeat_canceller(hb_id):
+            return f"Heartbeat {hb_id} cancelled."
+        return f"Heartbeat {hb_id} not found or already fired."
     
     def _add_job(
         self,

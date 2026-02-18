@@ -12,7 +12,7 @@ from getall.agent.tools.base import Tool
 # Image extensions to scan for after command execution
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
 # Directories to scan for newly generated images
-_SCAN_DIRS = ["/tmp", "/tmp/getall_charts"]
+_SCAN_DIRS = ["/tmp", "/tmp/getall_charts", "/tmp/getall_memes"]
 
 
 class ExecTool(Tool):

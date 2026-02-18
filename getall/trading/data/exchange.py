@@ -21,7 +21,7 @@ import ccxt
 
 
 # 支持的交易所白名单
-SUPPORTED_EXCHANGES = {"binance", "bitget"}
+SUPPORTED_EXCHANGES = {"binance", "bitget", "okx", "bybit", "coinbase", "kraken", "kucoin"}
 
 
 class ExchangeAdapter:

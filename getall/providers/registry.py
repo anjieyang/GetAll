@@ -103,6 +103,25 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         model_overrides=(),
     ),
 
+    # CloudsWay MaaS: OpenAI-compatible gateway.
+    # Model IDs are opaque (e.g. MaaS_Cl_Sonnet_4.5), matched by "maas" keyword.
+    ProviderSpec(
+        name="cloudsway",
+        keywords=("cloudsway", "maas"),
+        env_key="CLOUDSWAY_API_KEY",
+        display_name="CloudsWay MaaS",
+        litellm_prefix="openai",             # OpenAI-compatible endpoint
+        skip_prefixes=("openai/",),
+        env_extras=(),
+        is_gateway=True,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="cloudsway",
+        default_api_base="",                  # URL includes project path, must be configured
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
+
     # === Standard providers (matched by model-name keywords) ===============
 
     # Anthropic: LiteLLM recognizes "claude-*" natively, no prefix needed.
@@ -123,14 +142,15 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         model_overrides=(),
     ),
 
-    # OpenAI: LiteLLM recognizes "gpt-*" natively, no prefix needed.
+    # OpenAI: explicit "openai/" prefix ensures LiteLLM routes correctly
+    # for newer model names that it may not auto-detect (e.g. gpt-codex-5.2).
     ProviderSpec(
         name="openai",
         keywords=("openai", "gpt"),
         env_key="OPENAI_API_KEY",
         display_name="OpenAI",
-        litellm_prefix="",
-        skip_prefixes=(),
+        litellm_prefix="openai",
+        skip_prefixes=("openai/",),
         env_extras=(),
         is_gateway=False,
         is_local=False,
@@ -217,6 +237,27 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         model_overrides=(),
     ),
 
+    # Volcengine Ark (BytePlus): hosts third-party models via OpenAI-compatible API.
+    # Keyword "kimi-k2-5" matches Ark deployment IDs (dash, not dot) without
+    # colliding with Moonshot's native "kimi-k2.5" (dot).
+    # Placed before Moonshot so the more-specific keyword wins.
+    ProviderSpec(
+        name="volcengine",
+        keywords=("volcengine", "kimi-k2-5"),
+        env_key="VOLCENGINE_API_KEY",
+        display_name="Volcengine Ark",
+        litellm_prefix="openai",             # OpenAI-compatible → openai/{model}
+        skip_prefixes=("openai/",),
+        env_extras=(),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="bytepluses",
+        default_api_base="https://ark.ap-southeast.bytepluses.com/api/v3",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
+
     # Moonshot: Kimi models, needs "moonshot/" prefix.
     # LiteLLM requires MOONSHOT_API_BASE env var to find the endpoint.
     # Kimi K2.5 API enforces temperature >= 1.0.
@@ -241,21 +282,22 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         ),
     ),
 
-    # MiniMax: needs "minimax/" prefix for LiteLLM routing.
-    # Uses OpenAI-compatible API at api.minimax.io/v1.
+    # MiniMax: Anthropic-compatible API at api.minimaxi.com/anthropic.
+    # Uses "anthropic/" prefix so LiteLLM speaks the Anthropic message format;
+    # api_base is overridden per-call to route to MiniMax's endpoint.
     ProviderSpec(
         name="minimax",
         keywords=("minimax",),
         env_key="MINIMAX_API_KEY",
         display_name="MiniMax",
-        litellm_prefix="minimax",            # MiniMax-M2.1 → minimax/MiniMax-M2.1
-        skip_prefixes=("minimax/", "openrouter/"),
+        litellm_prefix="anthropic",          # MiniMax-M2.5 → anthropic/MiniMax-M2.5
+        skip_prefixes=("anthropic/", "openrouter/"),
         env_extras=(),
         is_gateway=False,
         is_local=False,
         detect_by_key_prefix="",
-        detect_by_base_keyword="",
-        default_api_base="https://api.minimax.io/v1",
+        detect_by_base_keyword="minimaxi",   # detect api.minimaxi.com in api_base
+        default_api_base="https://api.minimaxi.com/anthropic",
         strip_model_prefix=False,
         model_overrides=(),
     ),

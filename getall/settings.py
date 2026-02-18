@@ -36,9 +36,6 @@ class GetAllSettings(BaseSettings):
     state_dir: Path = Field(default_factory=lambda: Path.home() / ".getall")
     workspace_dir: Path = Field(default_factory=lambda: Path.home() / ".getall" / "workspace")
 
-    # --- LLM ---
-    llm_model: str = "anthropic/claude-3-5-sonnet-latest"
-
     # --- Bitget (direct REST; credentials are per-user via DB) ---
     bitget_base_url: str = "https://api.bitget.com"
 

@@ -1,0 +1,695 @@
+{
+  "version": 1,
+  "jobs": [
+    {
+      "id": "a4ef0ca8",
+      "name": "\u751f\u6210\u5e02\u573a\u65e9\u62a5\uff1a\u4ea4\u6613\u673a\u4f1a+\u4e3b\u8981\u4ea4\u6613\u6240\u5927\u52a8\u6001\uff08\u9762\u5411\u7fa4\u804a\uff09\u3002",
+      "enabled": true,
+      "schedule": {
+        "kind": "cron",
+        "atMs": null,
+        "everyMs": null,
+        "expr": "0 1 * * *",
+        "tz": null
+      },
+      "payload": {
+        "kind": "agent_turn",
+        "message": "\u751f\u6210\u5e02\u573a\u65e9\u62a5\uff1a\u4ea4\u6613\u673a\u4f1a+\u4e3b\u8981\u4ea4\u6613\u6240\u5927\u52a8\u6001\uff08\u9762\u5411\u7fa4\u804a\uff09\u3002",
+        "deliver": true,
+        "channel": "feishu",
+        "to": "oc_1146e92be4386e34fc6d1e70b38f6da7",
+        "finalMessage": null,
+        "tenantId": "default",
+        "principalId": "9cdc91f6-155b-4491-8193-693b1bfc84d2",
+        "agentIdentityId": "d5141469-7749-499e-8496-e52af6d2bf52",
+        "senderId": "ou_62f468a55eb42537782e5ca5d1a2f205",
+        "threadId": "om_x100b57daabac80a0e2e6c991db4e169",
+        "chatType": "group"
+      },
+      "state": {
+        "nextRunAtMs": 1771462800000,
+        "lastRunAtMs": 1771376400002,
+        "runCount": 4,
+        "lastStatus": "ok",
+        "lastError": null,
+        "consecutiveFailures": 0,
+        "runningAtMs": null,
+        "retryCount": 0
+      },
+      "config": {
+        "timeoutMs": 7200000,
+        "maxRetries": 3,
+        "retryBackoffBase": 2.0,
+        "alertThreshold": 5
+      },
+      "createdAtMs": 1770974819592,
+      "updatedAtMs": 1771376416422,
+      "deleteAfterRun": false,
+      "maxRuns": null
+    },
+    {
+      "id": "c314ff25",
+      "name": "\u53d1\u9001\u65e9\u62a5\uff1a\u5e02\u573a\u673a\u4f1a\u4e0e\u4e3b\u8981\u4ea4\u6613\u6240\u52a8\u6001",
+      "enabled": false,
+      "schedule": {
+        "kind": "cron",
+        "atMs": null,
+        "everyMs": null,
+        "expr": "0 1 * * *",
+        "tz": null
+      },
+      "payload": {
+        "kind": "direct_message",
+        "message": "\u53d1\u9001\u65e9\u62a5\uff1a\u5e02\u573a\u673a\u4f1a\u4e0e\u4e3b\u8981\u4ea4\u6613\u6240\u52a8\u6001",
+        "deliver": true,
+        "channel": "feishu",
+        "to": "oc_1146e92be4386e34fc6d1e70b38f6da7",
+        "finalMessage": null,
+        "tenantId": "default",
+        "principalId": "9cdc91f6-155b-4491-8193-693b1bfc84d2",
+        "agentIdentityId": "d5141469-7749-499e-8496-e52af6d2bf52",
+        "senderId": "ou_29fb78787140964561a6c824f7a6e944",
+        "threadId": "",
+        "chatType": "group"
+      },
+      "state": {
+        "nextRunAtMs": 1771117200000,
+        "lastRunAtMs": 1771030970195,
+        "runCount": 1,
+        "lastStatus": "ok",
+        "lastError": null,
+        "consecutiveFailures": 0,
+        "runningAtMs": null,
+        "retryCount": 0
+      },
+      "config": {
+        "timeoutMs": 7200000,
+        "maxRetries": 3,
+        "retryBackoffBase": 2.0,
+        "alertThreshold": 5
+      },
+      "createdAtMs": 1770974845343,
+      "updatedAtMs": 1771030970195,
+      "deleteAfterRun": false,
+      "maxRuns": null
+    },
+    {
+      "id": "12f03da1",
+      "name": "\u53d1\u9001\u6bcf\u65e5\u5e02\u573a\u65e9\u62a5\uff1a\u884c\u60c5\u6982\u89c8\u3001\u4ea4\u6613\u673a\u4f1a\u3001\u884d\u751f\u54c1\u52a8\u6001\u3001\u4ea4\u6613\u6240\u52a8\u5411",
+      "enabled": true,
+      "schedule": {
+        "kind": "cron",
+        "atMs": null,
+        "everyMs": null,
+        "expr": "30 17 * * *",
+        "tz": null
+      },
+      "payload": {
+        "kind": "agent_turn",
+        "message": "\u53d1\u9001\u6bcf\u65e5\u5e02\u573a\u65e9\u62a5\uff1a\u884c\u60c5\u6982\u89c8\u3001\u4ea4\u6613\u673a\u4f1a\u3001\u884d\u751f\u54c1\u52a8\u6001\u3001\u4ea4\u6613\u6240\u52a8\u5411\u3001\u8981\u95fb\u7b80\u62a5\uff08\u5317\u4eac\u65f6\u95f417:30\uff09",
+        "deliver": true,
+        "channel": "feishu",
+        "to": "oc_1146e92be4386e34fc6d1e70b38f6da7",
+        "finalMessage": null,
+        "tenantId": "default",
+        "principalId": "9cdc91f6-155b-4491-8193-693b1bfc84d2",
+        "agentIdentityId": "d5141469-7749-499e-8496-e52af6d2bf52",
+        "senderId": "ou_62f468a55eb42537782e5ca5d1a2f205",
+        "threadId": "om_x100b57daa6563534e2b4b1703975c4b",
+        "chatType": "group"
+      },
+      "state": {
+        "nextRunAtMs": 1771435800000,
+        "lastRunAtMs": 1771349438554,
+        "runCount": 5,
+        "lastStatus": "ok",
+        "lastError": null,
+        "consecutiveFailures": 0,
+        "runningAtMs": null,
+        "retryCount": 0
+      },
+      "config": {
+        "timeoutMs": 7200000,
+        "maxRetries": 3,
+        "retryBackoffBase": 2.0,
+        "alertThreshold": 5
+      },
+      "createdAtMs": 1770974885369,
+      "updatedAtMs": 1771349463235,
+      "deleteAfterRun": false,
+      "maxRuns": null
+    },
+    {
+      "id": "f3adab85",
+      "name": "\u751f\u6210\u5e76\u53d1\u9001\u300c\u5168\u7403\u8d44\u4ea7\u65e5\u62a5\uff08\u6df1\u5ea6\u7248\uff09\u300d\uff1a\u542b\u8d44\u4ea7\u5f02\u52a8\u3001\u5b8f\u89c2/\u653f\u6cbb",
+      "enabled": true,
+      "schedule": {
+        "kind": "cron",
+        "atMs": null,
+        "everyMs": null,
+        "expr": "30 2 * * *",
+        "tz": null
+      },
+      "payload": {
+        "kind": "agent_turn",
+        "message": "\u751f\u6210\u5e76\u53d1\u9001\u300c\u5168\u7403\u8d44\u4ea7\u65e5\u62a5\uff08\u6df1\u5ea6\u7248\uff09\u300d\uff1a\u542b\u8d44\u4ea7\u5f02\u52a8\u3001\u5b8f\u89c2/\u653f\u6cbb\u4e8b\u4ef6\u3001\u6f5c\u5728\u4e2d\u957f\u671f\u8d5b\u9053\u673a\u4f1a\uff0c\u5e76\u9644\u6765\u6e90\u94fe\u63a5\uff08Markdown\uff09\u3002",
+        "deliver": true,
+        "channel": "feishu",
+        "to": "ou_8098fbb96af298bd3cea21e02f1c4fc5",
+        "finalMessage": null,
+        "tenantId": "default",
+        "principalId": "af7252ca-6e51-4433-bb48-ccd7dcff98ec",
+        "agentIdentityId": "e1ad92e5-f67e-4d9b-9962-bdbd661a736e",
+        "senderId": "ou_8098fbb96af298bd3cea21e02f1c4fc5",
+        "threadId": "",
+        "chatType": "private"
+      },
+      "state": {
+        "nextRunAtMs": 1771468200000,
+        "lastRunAtMs": 1771381800002,
+        "runCount": 5,
+        "lastStatus": "ok",
+        "lastError": null,
+        "consecutiveFailures": 0,
+        "runningAtMs": null,
+        "retryCount": 0
+      },
+      "config": {
+        "timeoutMs": 7200000,
+        "maxRetries": 3,
+        "retryBackoffBase": 2.0,
+        "alertThreshold": 5
+      },
+      "createdAtMs": 1770985427848,
+      "updatedAtMs": 1771381826237,
+      "deleteAfterRun": false,
+      "maxRuns": null
+    },
+    {
+      "id": "a6256b54",
+      "name": "[BTC Monitor] Run every 5 min.",
+      "enabled": true,
+      "schedule": {
+        "kind": "every",
+        "atMs": null,
+        "everyMs": 300000,
+        "expr": null,
+        "tz": null
+      },
+      "payload": {
+        "kind": "agent_turn",
+        "message": "[BTC Monitor] Run every 5 min. 1H trend via swing highs/lows (last 100 candles). 15m entries via candlestick patterns. Key levels: use trend timeframe candles \u2264150, keep swing highs/lows with \u22653 touches, merge within 0.25%, label resistance/support. On entry signal, output trade plan with RR; if RR<1.25, skip plan.",
+        "deliver": true,
+        "channel": "feishu",
+        "to": "ou_217a859c2584534487bce41430c6e970",
+        "finalMessage": null,
+        "tenantId": "default",
+        "principalId": "51b01f30-51ba-41aa-be71-2ceac1d05e6b",
+        "agentIdentityId": "621bc29b-fca9-42c2-a60a-221b65f641e2",
+        "senderId": "ou_217a859c2584534487bce41430c6e970",
+        "threadId": "om_x100b57c69f839ca8e2b9ba1ae640c86",
+        "chatType": "private"
+      },
+      "state": {
+        "nextRunAtMs": 1771383061132,
+        "lastRunAtMs": 1771382730021,
+        "runCount": 1071,
+        "lastStatus": "ok",
+        "lastError": null,
+        "consecutiveFailures": 0,
+        "runningAtMs": null,
+        "retryCount": 0
+      },
+      "config": {
+        "timeoutMs": 7200000,
+        "maxRetries": 3,
+        "retryBackoffBase": 2.0,
+        "alertThreshold": 5
+      },
+      "createdAtMs": 1770991104622,
+      "updatedAtMs": 1771382761132,
+      "deleteAfterRun": false,
+      "maxRuns": null
+    },
+    {
+      "id": "0e209485",
+      "name": "\u6bcf15\u5206\u949f\u83b7\u53d6BTC/USDT 15m/1h/4h/1d K",
+      "enabled": true,
+      "schedule": {
+        "kind": "every",
+        "atMs": null,
+        "everyMs": 900000,
+        "expr": null,
+        "tz": null
+      },
+      "payload": {
+        "kind": "agent_turn",
+        "message": "\u6bcf15\u5206\u949f\u83b7\u53d6BTC/USDT 15m/1h/4h/1d K\u7ebf\uff0c\u8ba1\u7b97MA7/MA25\u3001MACD\u3001RSI\uff0c\u591a\u5468\u671f\u5171\u632f\u5206\u6790\u5e76\u8f93\u51fa\u62a5\u544a\u3002\u82e515\u5206\u949f\u5185\u6da8\u8dcc\u5e45>1%\u6216\u7a81\u7834\u5173\u952e\u652f\u6491/\u963b\u529b\uff0c\u7acb\u5373\u5728\u62a5\u544a\u4e2d\u53d1\u51fa\u8b66\u62a5\u5e76\u5355\u72ec\u63d0\u793a\u3002",
+        "deliver": true,
+        "channel": "feishu",
+        "to": "ou_34d8f997218db9f31fae61b7eda3a041",
+        "finalMessage": null,
+        "tenantId": "default",
+        "principalId": "4ece738f-7b67-488b-82d5-c6e262834d5c",
+        "agentIdentityId": "82a0cce1-84c8-4a21-8a46-6958b2bb8645",
+        "senderId": "ou_34d8f997218db9f31fae61b7eda3a041",
+        "threadId": "",
+        "chatType": "private"
+      },
+      "state": {
+        "nextRunAtMs": 1771383549026,
+        "lastRunAtMs": 1771382620890,
+        "runCount": 377,
+        "lastStatus": "ok",
+        "lastError": null,
+        "consecutiveFailures": 0,
+        "runningAtMs": null,
+        "retryCount": 0
+      },
+      "config": {
+        "timeoutMs": 7200000,
+        "maxRetries": 3,
+        "retryBackoffBase": 2.0,
+        "alertThreshold": 5
+      },
+      "createdAtMs": 1770991114994,
+      "updatedAtMs": 1771382649026,
+      "deleteAfterRun": false,
+      "maxRuns": null
+    },
+    {
+      "id": "d87b3ad6",
+      "name": "bitget-usdt-1d",
+      "enabled": true,
+      "schedule": {
+        "kind": "cron",
+        "atMs": null,
+        "everyMs": null,
+        "expr": "0 1 * * *",
+        "tz": null
+      },
+      "payload": {
+        "kind": "agent_turn",
+        "message": "python /root/.getall/workspace/shared/scripts/bitget_usdt_futures_daily_kline.py",
+        "deliver": false,
+        "channel": null,
+        "to": null,
+        "finalMessage": null,
+        "tenantId": "default",
+        "principalId": "",
+        "agentIdentityId": "",
+        "senderId": "",
+        "threadId": "",
+        "chatType": "private"
+      },
+      "state": {
+        "nextRunAtMs": 1771462800000,
+        "lastRunAtMs": 1771376416422,
+        "runCount": 4,
+        "lastStatus": "ok",
+        "lastError": null,
+        "consecutiveFailures": 0,
+        "runningAtMs": null,
+        "retryCount": 0
+      },
+      "config": {
+        "timeoutMs": 7200000,
+        "maxRetries": 3,
+        "retryBackoffBase": 2.0,
+        "alertThreshold": 5
+      },
+      "createdAtMs": 1770993749475,
+      "updatedAtMs": 1771377009228,
+      "deleteAfterRun": false,
+      "maxRuns": null
+    },
+    {
+      "id": "6dd94402",
+      "name": "HYPE \u65e5\u5185\u4ef7\u683c\u6ce2\u52a8\u63d0\u9192",
+      "enabled": true,
+      "schedule": {
+        "kind": "cron",
+        "atMs": null,
+        "everyMs": null,
+        "expr": "0 9 * * *",
+        "tz": null
+      },
+      "payload": {
+        "kind": "agent_turn",
+        "message": "HYPE \u65e5\u5185\u4ef7\u683c\u6ce2\u52a8\u63d0\u9192",
+        "deliver": true,
+        "channel": "feishu",
+        "to": "ou_0067604f3d15b79ea4381e6b4d12a721",
+        "finalMessage": null,
+        "tenantId": "default",
+        "principalId": "3980cf54-3a5f-4177-86a6-5d23efd0d25f",
+        "agentIdentityId": "80050dfb-1e82-4372-ba02-70c169c4cabb",
+        "senderId": "ou_0067604f3d15b79ea4381e6b4d12a721",
+        "threadId": "",
+        "chatType": "private"
+      },
+      "state": {
+        "nextRunAtMs": 1771405200000,
+        "lastRunAtMs": 1771318800002,
+        "runCount": 4,
+        "lastStatus": "ok",
+        "lastError": null,
+        "consecutiveFailures": 0,
+        "runningAtMs": null,
+        "retryCount": 0
+      },
+      "config": {
+        "timeoutMs": 7200000,
+        "maxRetries": 3,
+        "retryBackoffBase": 2.0,
+        "alertThreshold": 5
+      },
+      "createdAtMs": 1770994395236,
+      "updatedAtMs": 1771318807434,
+      "deleteAfterRun": false,
+      "maxRuns": null
+    },
+    {
+      "id": "8c1658ce",
+      "name": "HYPE \u4ef7\u683c\u6ce2\u52a8\u63d0\u9192",
+      "enabled": true,
+      "schedule": {
+        "kind": "cron",
+        "atMs": null,
+        "everyMs": null,
+        "expr": "0 11-18 * * *",
+        "tz": null
+      },
+      "payload": {
+        "kind": "agent_turn",
+        "message": "HYPE \u4ef7\u683c\u6ce2\u52a8\u63d0\u9192",
+        "deliver": true,
+        "channel": "feishu",
+        "to": "ou_0067604f3d15b79ea4381e6b4d12a721",
+        "finalMessage": null,
+        "tenantId": "default",
+        "principalId": "3980cf54-3a5f-4177-86a6-5d23efd0d25f",
+        "agentIdentityId": "80050dfb-1e82-4372-ba02-70c169c4cabb",
+        "senderId": "ou_0067604f3d15b79ea4381e6b4d12a721",
+        "threadId": "",
+        "chatType": "private"
+      },
+      "state": {
+        "nextRunAtMs": 1771412400000,
+        "lastRunAtMs": 1771351200001,
+        "runCount": 35,
+        "lastStatus": "ok",
+        "lastError": null,
+        "consecutiveFailures": 0,
+        "runningAtMs": null,
+        "retryCount": 0
+      },
+      "config": {
+        "timeoutMs": 7200000,
+        "maxRetries": 3,
+        "retryBackoffBase": 2.0,
+        "alertThreshold": 5
+      },
+      "createdAtMs": 1770994452342,
+      "updatedAtMs": 1771351207546,
+      "deleteAfterRun": false,
+      "maxRuns": null
+    },
+    {
+      "id": "2ee7b08c",
+      "name": "\u6267\u884c\u5143\u80fd\u529b\u63d0\u5347\u5468\u4efb\u52a1\uff1a\n1. \u4fe1\u606f\u6e90\u63a2\u7d22\uff1a\u641c\u7d22\u5e76\u8bc4\u4f303\u4e2a\u65b0\u52a0",
+      "enabled": true,
+      "schedule": {
+        "kind": "cron",
+        "atMs": null,
+        "everyMs": null,
+        "expr": "0 17 * * 5",
+        "tz": null
+      },
+      "payload": {
+        "kind": "agent_turn",
+        "message": "\u6267\u884c\u5143\u80fd\u529b\u63d0\u5347\u5468\u4efb\u52a1\uff1a\n1. \u4fe1\u606f\u6e90\u63a2\u7d22\uff1a\u641c\u7d22\u5e76\u8bc4\u4f303\u4e2a\u65b0\u52a0\u5bc6\u6570\u636eAPI\uff0c\u6d4b\u8bd51\u4e2a\u94fe\u4e0a\u6570\u636e\u6e90\uff0c\u6293\u53d61\u4e2a\u793e\u4ea4\u60c5\u7eea\u6e90\n2. \u5de5\u5177\u5e93\u5efa\u8bbe\uff1a\u4ece\u6280\u80fd\u5e02\u573a\u53d1\u73b02\u4e2a\u5de5\u5177\uff0c\u6784\u5efa1\u4e2a\u53ef\u590d\u7528\u811a\u672c\uff0c\u4f18\u53161\u4e2a\u73b0\u6709\u5de5\u5177\n3. \u667a\u80fd\u4f18\u5316\uff1a\u5206\u6790\u8fc7\u53bb7\u5929\u6570\u636e\uff0c\u63d0\u53d61\u6761\u65b0\u89c4\u5f8b\uff0c\u66f4\u65b0\u7b56\u7565\u6216\u98ce\u63a7\u89c4\u5219\n4. \u81ea\u6211\u8bc4\u4f30\uff1a\u8bb0\u5f55\u91cc\u7a0b\u7891\uff0c\u89c4\u5212\u4e0b\u5468\u65b9\u5411\n\n\u5b8c\u6210\u540e\u6c47\u62a5\u5230\u7fa4\u91cc\uff0c\u5305\u62ec\uff1a\u672c\u5468\u65b0\u589e\u80fd\u529b\u3001\u8fbe\u6210\u91cc\u7a0b\u7891\u3001\u4e0b\u5468\u8ba1\u5212",
+        "deliver": true,
+        "channel": "feishu",
+        "to": "oc_1146e92be4386e34fc6d1e70b38f6da7",
+        "finalMessage": null,
+        "tenantId": "default",
+        "principalId": "9cdc91f6-155b-4491-8193-693b1bfc84d2",
+        "agentIdentityId": "d5141469-7749-499e-8496-e52af6d2bf52",
+        "senderId": "ou_bae8a4ce82a51d7530ffac8421a57600",
+        "threadId": "",
+        "chatType": "group"
+      },
+      "state": {
+        "nextRunAtMs": 1771606800000,
+        "lastRunAtMs": null,
+        "runCount": 0,
+        "lastStatus": null,
+        "lastError": null,
+        "consecutiveFailures": 0,
+        "runningAtMs": null,
+        "retryCount": 0
+      },
+      "config": {
+        "timeoutMs": 7200000,
+        "maxRetries": 3,
+        "retryBackoffBase": 2.0,
+        "alertThreshold": 5
+      },
+      "createdAtMs": 1771060276761,
+      "updatedAtMs": 1771060276761,
+      "deleteAfterRun": false,
+      "maxRuns": null
+    },
+    {
+      "id": "decfbd97",
+      "name": "\u6267\u884c\u6708\u5ea6\u6df1\u5ea6\u8fdb\u5316\u4efb\u52a1\uff1a\n1. \u56de\u987e\u8fc7\u53bb30\u5929\u6240\u6709\u4ea4\u6613\u3001\u56de\u6d4b\u3001",
+      "enabled": true,
+      "schedule": {
+        "kind": "cron",
+        "atMs": null,
+        "everyMs": null,
+        "expr": "0 10 1 * *",
+        "tz": null
+      },
+      "payload": {
+        "kind": "agent_turn",
+        "message": "\u6267\u884c\u6708\u5ea6\u6df1\u5ea6\u8fdb\u5316\u4efb\u52a1\uff1a\n1. \u56de\u987e\u8fc7\u53bb30\u5929\u6240\u6709\u4ea4\u6613\u3001\u56de\u6d4b\u3001\u7b56\u7565\u8868\u73b0\n2. \u8bc6\u522b\u7cfb\u7edf\u6027\u5f31\u70b9\uff08\u91cd\u590d\u5931\u8d25\u7684\u573a\u666f\u3001\u7f3a\u5931\u7684\u80fd\u529b\uff09\n3. \u8bbe\u8ba1\u5e76\u5b9e\u73b01\u4e2a\u91cd\u5927\u80fd\u529b\u63d0\u5347\u9879\u76ee\uff08\u65b0\u6280\u80fd/\u65b0\u6570\u636e\u6e90/\u65b0\u7b97\u6cd5\uff09\n4. \u66f4\u65b0\u5143\u80fd\u529b\u57fa\u7ebf\u8bc4\u4f30\n5. \u751f\u6210\u6708\u5ea6\u8fdb\u5316\u62a5\u544a\uff1a\u65b0\u589e\u80fd\u529b\u77e9\u9635\u3001\u91cc\u7a0b\u7891\u8fdb\u5ea6\u3001\u4e0b\u6708OKR\n\n\u6c47\u62a5\u5230\u7fa4\u91cc\uff0c\u9644\u5b8c\u6574\u8fdb\u5316\u62a5\u544a",
+        "deliver": true,
+        "channel": "feishu",
+        "to": "oc_1146e92be4386e34fc6d1e70b38f6da7",
+        "finalMessage": null,
+        "tenantId": "default",
+        "principalId": "9cdc91f6-155b-4491-8193-693b1bfc84d2",
+        "agentIdentityId": "d5141469-7749-499e-8496-e52af6d2bf52",
+        "senderId": "ou_bae8a4ce82a51d7530ffac8421a57600",
+        "threadId": "",
+        "chatType": "group"
+      },
+      "state": {
+        "nextRunAtMs": 1772359200000,
+        "lastRunAtMs": null,
+        "runCount": 0,
+        "lastStatus": null,
+        "lastError": null,
+        "consecutiveFailures": 0,
+        "runningAtMs": null,
+        "retryCount": 0
+      },
+      "config": {
+        "timeoutMs": 7200000,
+        "maxRetries": 3,
+        "retryBackoffBase": 2.0,
+        "alertThreshold": 5
+      },
+      "createdAtMs": 1771060284987,
+      "updatedAtMs": 1771060284987,
+      "deleteAfterRun": false,
+      "maxRuns": null
+    },
+    {
+      "id": "3ad48e30",
+      "name": "\ud83d\udd2c \u5143\u80fd\u529b\u63d0\u5347 - \u5468\u4efb\u52a1\u6267\u884c\n\n**\u672c\u5468\u8fdb\u5316\u6e05\u5355**\uff1a\n1",
+      "enabled": true,
+      "schedule": {
+        "kind": "cron",
+        "atMs": null,
+        "everyMs": null,
+        "expr": "0 17 * * 5",
+        "tz": null
+      },
+      "payload": {
+        "kind": "agent_turn",
+        "message": "\ud83d\udd2c \u5143\u80fd\u529b\u63d0\u5347 - \u5468\u4efb\u52a1\u6267\u884c\n\n**\u672c\u5468\u8fdb\u5316\u6e05\u5355**\uff1a\n1. \u63a2\u7d22 3 \u4e2a\u65b0\u6570\u636e\u6e90\uff08API/\u722c\u866b/\u5de5\u5177\uff09\n2. \u6784\u5efa/\u4f18\u5316 1-2 \u4e2a\u53ef\u590d\u7528\u5de5\u5177\n3. \u63d0\u53d6\u5e76\u8bb0\u5f55\u4ea4\u6613\u667a\u6167\n4. \u6c47\u603b\u8fdb\u5316\u6210\u679c\n\n\u8bb0\u5f55\u5230 memory/evolution/ \u5e76 @ Monica \u6c47\u62a5",
+        "deliver": true,
+        "channel": "feishu",
+        "to": "oc_1146e92be4386e34fc6d1e70b38f6da7",
+        "finalMessage": null,
+        "tenantId": "default",
+        "principalId": "9cdc91f6-155b-4491-8193-693b1bfc84d2",
+        "agentIdentityId": "d5141469-7749-499e-8496-e52af6d2bf52",
+        "senderId": "ou_29fb78787140964561a6c824f7a6e944",
+        "threadId": "om_x100b56378118d8a4e2cb2b0f0bfea26",
+        "chatType": "group"
+      },
+      "state": {
+        "nextRunAtMs": 1771606800000,
+        "lastRunAtMs": null,
+        "runCount": 0,
+        "lastStatus": null,
+        "lastError": null,
+        "consecutiveFailures": 0,
+        "runningAtMs": null,
+        "retryCount": 0
+      },
+      "config": {
+        "timeoutMs": 7200000,
+        "maxRetries": 3,
+        "retryBackoffBase": 2.0,
+        "alertThreshold": 5
+      },
+      "createdAtMs": 1771060593692,
+      "updatedAtMs": 1771060593692,
+      "deleteAfterRun": false,
+      "maxRuns": null
+    },
+    {
+      "id": "602dc24b",
+      "name": "\ud83d\ude80 \u5143\u80fd\u529b\u63d0\u5347 - \u6708\u5ea6\u6df1\u5ea6\u56de\u987e\n\n**\u6708\u5ea6\u8fdb\u5316\u4efb\u52a1**\uff1a\n",
+      "enabled": true,
+      "schedule": {
+        "kind": "cron",
+        "atMs": null,
+        "everyMs": null,
+        "expr": "0 10 1 * *",
+        "tz": null
+      },
+      "payload": {
+        "kind": "agent_turn",
+        "message": "\ud83d\ude80 \u5143\u80fd\u529b\u63d0\u5347 - \u6708\u5ea6\u6df1\u5ea6\u56de\u987e\n\n**\u6708\u5ea6\u8fdb\u5316\u4efb\u52a1**\uff1a\n1. \u56de\u987e\u8fc7\u53bb 30 \u5929\u6240\u6709\u8fdb\u5316\u8bb0\u5f55\n2. \u8bc6\u522b\u7cfb\u7edf\u6027\u5f31\u70b9\u548c\u77ed\u677f\n3. \u8bbe\u8ba1\u91cd\u5927\u80fd\u529b\u5347\u7ea7\u65b9\u6848\n4. \u751f\u6210\u5b8c\u6574\u6708\u5ea6\u8fdb\u5316\u62a5\u544a\n\n\u8bb0\u5f55\u5230 memory/evolution/ \u5e76 @ Monica \u6c47\u62a5",
+        "deliver": true,
+        "channel": "feishu",
+        "to": "oc_1146e92be4386e34fc6d1e70b38f6da7",
+        "finalMessage": null,
+        "tenantId": "default",
+        "principalId": "9cdc91f6-155b-4491-8193-693b1bfc84d2",
+        "agentIdentityId": "d5141469-7749-499e-8496-e52af6d2bf52",
+        "senderId": "ou_29fb78787140964561a6c824f7a6e944",
+        "threadId": "om_x100b56378118d8a4e2cb2b0f0bfea26",
+        "chatType": "group"
+      },
+      "state": {
+        "nextRunAtMs": 1772359200000,
+        "lastRunAtMs": null,
+        "runCount": 0,
+        "lastStatus": null,
+        "lastError": null,
+        "consecutiveFailures": 0,
+        "runningAtMs": null,
+        "retryCount": 0
+      },
+      "config": {
+        "timeoutMs": 7200000,
+        "maxRetries": 3,
+        "retryBackoffBase": 2.0,
+        "alertThreshold": 5
+      },
+      "createdAtMs": 1771060593693,
+      "updatedAtMs": 1771060593693,
+      "deleteAfterRun": false,
+      "maxRuns": null
+    },
+    {
+      "id": "bf8e2f1c",
+      "name": "\u5143\u80fd\u529b\u63d0\u5347 - \u6bcf\u65e5\u6267\u884c\uff1a\n1. \u63a2\u7d221\u4e2a\u65b0\u6570\u636e\u6e90/API\n",
+      "enabled": true,
+      "schedule": {
+        "kind": "cron",
+        "atMs": null,
+        "everyMs": null,
+        "expr": "0 23 * * *",
+        "tz": null
+      },
+      "payload": {
+        "kind": "agent_turn",
+        "message": "\u5143\u80fd\u529b\u63d0\u5347 - \u6bcf\u65e5\u6267\u884c\uff1a\n1. \u63a2\u7d221\u4e2a\u65b0\u6570\u636e\u6e90/API\n2. \u6784\u5efa/\u4f18\u53161\u4e2a\u5de5\u5177\n3. \u63d0\u53d6\u4ea4\u6613\u667a\u6167\n4. \u590d\u76d8\u4eca\u65e5\u7fa4\u804a\uff1a\u8bc6\u522b\u53ef\u590d\u7528\u5de5\u4f5c\u6d41\u2192\u521b\u5efaskill\uff0c\u8bc6\u522b\u9519\u8bef\u2192\u5199\u5165SOUL\n\u5b8c\u6210\u540e @Monica Wan \u6c47\u62a5",
+        "deliver": true,
+        "channel": "feishu",
+        "to": "oc_1146e92be4386e34fc6d1e70b38f6da7",
+        "finalMessage": null,
+        "tenantId": "default",
+        "principalId": "9cdc91f6-155b-4491-8193-693b1bfc84d2",
+        "agentIdentityId": "d5141469-7749-499e-8496-e52af6d2bf52",
+        "senderId": "ou_bae8a4ce82a51d7530ffac8421a57600",
+        "threadId": "",
+        "chatType": "group"
+      },
+      "state": {
+        "nextRunAtMs": 1771455600000,
+        "lastRunAtMs": 1771369200002,
+        "runCount": 4,
+        "lastStatus": "ok",
+        "lastError": null,
+        "consecutiveFailures": 0,
+        "runningAtMs": null,
+        "retryCount": 0
+      },
+      "config": {
+        "timeoutMs": 7200000,
+        "maxRetries": 3,
+        "retryBackoffBase": 2.0,
+        "alertThreshold": 5
+      },
+      "createdAtMs": 1771061252797,
+      "updatedAtMs": 1771369266408,
+      "deleteAfterRun": false,
+      "maxRuns": null
+    },
+    {
+      "id": "e31f73a5",
+      "name": "\u68c0\u67e5\u4eca\u65e5\u53cd\u9988\u63d0\u4ea4\u60c5\u51b5\uff1a\u6267\u884c feedback(action=",
+      "enabled": true,
+      "schedule": {
+        "kind": "cron",
+        "atMs": null,
+        "everyMs": null,
+        "expr": "0 21 * * *",
+        "tz": null
+      },
+      "payload": {
+        "kind": "agent_turn",
+        "message": "\u68c0\u67e5\u4eca\u65e5\u53cd\u9988\u63d0\u4ea4\u60c5\u51b5\uff1a\u6267\u884c feedback(action=\"list\", filter_status=\"all\")\uff0c\u5982\u679c\u6709\u65b0\u53cd\u9988\u5219\u6c47\u603b\u8be6\u60c5\u5e76\u901a\u77e5\u7ba1\u7406\u5458\uff1b\u5982\u679c\u6ca1\u6709\u65b0\u53cd\u9988\u5219\u7b80\u5355\u62a5\u544a\"\u4eca\u65e5\u65e0\u65b0\u53cd\u9988\"\u3002",
+        "deliver": true,
+        "channel": "feishu",
+        "to": "ou_29fb78787140964561a6c824f7a6e944",
+        "finalMessage": null,
+        "tenantId": "default",
+        "principalId": "0cf8535e-bc70-4180-9c63-68c3099f4f73",
+        "agentIdentityId": "61e35af7-c661-49bc-b1b9-5cb3e6b37e98",
+        "senderId": "ou_29fb78787140964561a6c824f7a6e944",
+        "threadId": "",
+        "chatType": "private"
+      },
+      "state": {
+        "nextRunAtMs": 1771448400000,
+        "lastRunAtMs": 1771362000001,
+        "runCount": 4,
+        "lastStatus": "ok",
+        "lastError": null,
+        "consecutiveFailures": 0,
+        "runningAtMs": null,
+        "retryCount": 0
+      },
+      "config": {
+        "timeoutMs": 7200000,
+        "maxRetries": 3,
+        "retryBackoffBase": 2.0,
+        "alertThreshold": 5
+      },
+      "createdAtMs": 1771072682013,
+      "updatedAtMs": 1771362016908,
+      "deleteAfterRun": false,
+      "maxRuns": null
+    }
+  ]
+}

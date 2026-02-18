@@ -26,13 +26,221 @@ import vectorbt as vbt
 from loguru import logger
 
 
+# pandas-ta can fail for some edge lengths (e.g., 1) on SMA.
+def _to_int(value: Any, default: int) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_float(value: Any, default: float | None = None) -> float | None:
+    if value is None:
+        return default
+    raw = value
+    if isinstance(raw, str):
+        raw = raw.strip().replace("%", "")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_sma(df: pd.DataFrame, params: dict[str, Any]) -> pd.Series:
+    period = _to_int(params.get("period", 20), 20)
+    if period <= 1:
+        return df["close"].copy()
+    out = ta.sma(df["close"], length=period)
+    if isinstance(out, pd.Series) and len(out) == len(df.index):
+        return out
+    return df["close"].rolling(window=period, min_periods=period).mean()
+
+
+def _normalize_token(raw: Any) -> str:
+    text = str(raw or "").strip().lower()
+    if not text:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+
+
+_INDICATOR_ALIASES: dict[str, str] = {
+    "bbands": "bollinger",
+    "bband": "bollinger",
+    "bollinger_bands": "bollinger",
+    "bollinger_band": "bollinger",
+    "bollingerbands": "bollinger",
+    "stochastic": "stoch",
+    "stochastics": "stoch",
+    "moving_average": "sma",
+    "movingaverage": "sma",
+    "ma": "sma",
+}
+
+_FIELD_ALIASES: dict[str, str] = {
+    "val": "value",
+    "current": "value",
+    "middle": "mid",
+    "midline": "mid",
+    "center": "mid",
+    "upper_band": "upper",
+    "lower_band": "lower",
+    "upperband": "upper",
+    "lowerband": "lower",
+    "signal_line": "signal",
+    "hist": "histogram",
+    "pct": "percent",
+    "percent_b": "percent",
+}
+
+_OPERATOR_ALIASES: dict[str, str] = {
+    "<": "lt",
+    ">": "gt",
+    "<=": "lte",
+    ">=": "gte",
+    "==": "eq",
+    "=": "eq",
+    "!=": "ne",
+    "<>": "ne",
+    "less_than": "lt",
+    "greater_than": "gt",
+    "less_or_equal": "lte",
+    "greater_or_equal": "gte",
+    "crossabove": "cross_above",
+    "cross_over": "cross_above",
+    "crossover": "cross_above",
+    "crossbelow": "cross_below",
+    "cross_under": "cross_below",
+    "crossunder": "cross_below",
+}
+
+_DIRECTION_ALIASES: dict[str, str] = {
+    "long_only": "long",
+    "longonly": "long",
+    "spot": "long",
+    "short_only": "short",
+    "shortonly": "short",
+    "long_short": "both",
+    "longshort": "both",
+}
+
+_SUPPORTED_OPERATORS = {"lt", "gt", "lte", "gte", "eq", "ne", "cross_above", "cross_below"}
+
+
+def _normalize_indicator_name(raw: Any) -> str:
+    token = _normalize_token(raw)
+    if not token:
+        return ""
+    return _INDICATOR_ALIASES.get(token, token)
+
+
+def _normalize_field_name(raw: Any) -> str:
+    token = _normalize_token(raw)
+    if not token:
+        return "value"
+    return _FIELD_ALIASES.get(token, token)
+
+
+def _normalize_direction(raw: Any) -> str:
+    token = _normalize_token(raw)
+    if not token:
+        return "long"
+    return _DIRECTION_ALIASES.get(token, token)
+
+
+def _dedupe_non_empty(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for v in values:
+        if not v or v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+    return out
+
+
+def _indicator_candidates(raw: Any) -> list[str]:
+    text = str(raw or "").strip()
+    token = _normalize_token(text)
+    canonical = _normalize_indicator_name(text)
+    return _dedupe_non_empty([text, text.lower(), token, canonical])
+
+
+def _field_candidates(raw: Any) -> list[str]:
+    text = str(raw or "").strip()
+    token = _normalize_token(text)
+    canonical = _normalize_field_name(text)
+    return _dedupe_non_empty([text, text.lower(), token, canonical])
+
+
+def _normalize_indicator_params(name: str, raw_params: Any) -> dict[str, Any]:
+    if not isinstance(raw_params, dict):
+        return {}
+
+    token_params = {_normalize_token(k): v for k, v in raw_params.items()}
+    normalized: dict[str, Any] = dict(token_params)
+
+    period = token_params.get("period", token_params.get("length", token_params.get("window")))
+    if period is not None:
+        normalized["period"] = _to_int(period, 20)
+
+    if name == "bollinger":
+        std = token_params.get("std", token_params.get("stddev", token_params.get("deviation")))
+        if std is not None:
+            normalized["std"] = _to_float(std, 2.0)
+    elif name == "macd":
+        fast = token_params.get("fast_period", token_params.get("fast"))
+        slow = token_params.get("slow_period", token_params.get("slow"))
+        signal = token_params.get("signal_period", token_params.get("signal"))
+        if fast is not None:
+            normalized["fast_period"] = _to_int(fast, 12)
+        if slow is not None:
+            normalized["slow_period"] = _to_int(slow, 26)
+        if signal is not None:
+            normalized["signal_period"] = _to_int(signal, 9)
+    elif name == "stoch":
+        k = token_params.get("period_k", token_params.get("k"))
+        d = token_params.get("period_d", token_params.get("d"))
+        if k is not None:
+            normalized["period_k"] = _to_int(k, 14)
+        if d is not None:
+            normalized["period_d"] = _to_int(d, 3)
+
+    return normalized
+
+
+def _lookup_indicator_series(
+    indicators: dict[str, pd.Series],
+    indicator_raw: Any,
+    field_raw: Any,
+) -> pd.Series | None:
+    base_keys = _indicator_candidates(indicator_raw)
+    field_keys = _field_candidates(field_raw)
+    field_norm = _normalize_field_name(field_raw)
+
+    lookup_keys: list[str] = []
+    if field_norm == "value":
+        for base in base_keys:
+            lookup_keys.extend([base, f"{base}_value"])
+    else:
+        for base in base_keys:
+            for field in field_keys:
+                lookup_keys.append(f"{base}_{field}")
+            lookup_keys.append(base)
+
+    for key in _dedupe_non_empty(lookup_keys):
+        series = indicators.get(key)
+        if isinstance(series, pd.Series):
+            return series
+    return None
+
+
 # ═══════════════════════════════════════════════════════
 # Indicator computation
 # ═══════════════════════════════════════════════════════
 
 _INDICATOR_REGISTRY: dict[str, dict[str, Any]] = {
     # Moving averages
-    "sma": {"fn": lambda df, p: ta.sma(df["close"], length=p.get("period", 20)), "defaults": {"period": 20}},
+    "sma": {"fn": _safe_sma, "defaults": {"period": 20}},
     "ema": {"fn": lambda df, p: ta.ema(df["close"], length=p.get("period", 20)), "defaults": {"period": 20}},
     "dema": {"fn": lambda df, p: ta.dema(df["close"], length=p.get("period", 20)), "defaults": {"period": 20}},
     "hma": {"fn": lambda df, p: ta.hma(df["close"], length=p.get("period", 20)), "defaults": {"period": 20}},
@@ -83,31 +291,54 @@ def compute_indicators(
     """Compute all requested indicators and return a flat {key: Series} dict."""
     result: dict[str, pd.Series] = {}
     for cfg in indicator_configs:
-        name = cfg["name"].lower()
-        params = {**_INDICATOR_REGISTRY.get(name, {}).get("defaults", {}), **cfg.get("params", {})}
-        key = cfg.get("key", name)
+        if not isinstance(cfg, dict):
+            logger.warning(f"Invalid indicator config type {type(cfg).__name__}, skipping")
+            continue
+
+        name = _normalize_indicator_name(cfg.get("name"))
+        if not name:
+            logger.warning("Indicator config missing 'name', skipping")
+            continue
+
         reg = _INDICATOR_REGISTRY.get(name)
         if reg is None:
             logger.warning(f"Unknown indicator '{name}', skipping")
             continue
+
+        params = {
+            **reg.get("defaults", {}),
+            **_normalize_indicator_params(name, cfg.get("params", {})),
+        }
+        key = _normalize_token(cfg.get("key", name)) or name
+
         try:
             out = reg["fn"](df, params)
         except Exception as e:
             logger.warning(f"Error computing indicator {name}: {e}")
             continue
+
         if reg.get("multi") and isinstance(out, pd.DataFrame) and out is not None:
             field_map = _MULTI_FIELD_MAP.get(name, {})
             for field_name, col_idx in field_map.items():
                 if col_idx < len(out.columns):
-                    result[f"{key}_{field_name}"] = out.iloc[:, col_idx]
+                    series = out.iloc[:, col_idx]
+                    result[f"{key}_{field_name}"] = series
+                    result.setdefault(f"{name}_{field_name}", series)
             # Also store first column as plain key for simple references
-            result[key] = out.iloc[:, 0]
+            first_col = out.iloc[:, 0]
+            result[key] = first_col
+            result.setdefault(name, first_col)
         elif isinstance(out, pd.Series):
             result[key] = out
+            result.setdefault(name, out)
+
     # Always include OHLCV as referenceable series
     for col in ("open", "high", "low", "close", "volume"):
         if col in df.columns:
             result[col] = df[col]
+    # Common alias used by strategy prompts.
+    if "close" in df.columns:
+        result["price"] = df["close"]
     return result
 
 
@@ -116,22 +347,30 @@ def compute_indicators(
 # ═══════════════════════════════════════════════════════
 
 def _resolve_value(
-    raw: float | int | str,
+    raw: Any,
     indicators: dict[str, pd.Series],
 ) -> pd.Series | float:
     """Resolve a condition threshold — either a literal number or an indicator reference."""
+    if isinstance(raw, pd.Series):
+        return raw
     if isinstance(raw, (int, float)):
         return float(raw)
-    s = str(raw)
+    s = str(raw).strip()
+    if not s:
+        return float("nan")
+
     # "indicator.field" e.g. "macd.signal" → key "macd_signal"
     if "." in s:
         ref_key, ref_field = s.split(".", 1)
-        lookup = f"{ref_key}_{ref_field}"
-        if lookup in indicators:
-            return indicators[lookup]
+        ref_series = _lookup_indicator_series(indicators, ref_key, ref_field)
+        if ref_series is not None:
+            return ref_series
+
     # Direct key
-    if s in indicators:
-        return indicators[s]
+    for key in _indicator_candidates(s):
+        if key in indicators:
+            return indicators[key]
+
     # Try as number
     try:
         return float(s)
@@ -140,8 +379,18 @@ def _resolve_value(
     return float("nan")
 
 
+def _normalize_operator(op: str) -> str:
+    """Normalize operator aliases to canonical engine operator names."""
+    raw = str(op or "").strip().lower()
+    if raw in _OPERATOR_ALIASES:
+        return _OPERATOR_ALIASES[raw]
+    token = _normalize_token(raw)
+    return _OPERATOR_ALIASES.get(token, raw)
+
+
 def _eval_op(current: pd.Series, op: str, threshold: pd.Series | float) -> pd.Series:
     """Apply a comparison operator and return a boolean Series."""
+    op = _normalize_operator(op)
     if op == "lt":
         return current < threshold
     if op == "gt":
@@ -154,6 +403,10 @@ def _eval_op(current: pd.Series, op: str, threshold: pd.Series | float) -> pd.Se
         if isinstance(threshold, pd.Series):
             return (current - threshold).abs() < 1e-8
         return (current - threshold).abs() < 1e-8
+    if op == "ne":
+        if isinstance(threshold, pd.Series):
+            return (current - threshold).abs() >= 1e-8
+        return (current - threshold).abs() >= 1e-8
     if op == "cross_above":
         prev = current.shift(1)
         if isinstance(threshold, pd.Series):
@@ -163,49 +416,306 @@ def _eval_op(current: pd.Series, op: str, threshold: pd.Series | float) -> pd.Se
         prev = current.shift(1)
         if isinstance(threshold, pd.Series):
             return (prev >= threshold.shift(1)) & (current < threshold)
-        return (prev >= threshold) & (current > threshold)
+        return (prev >= threshold) & (current < threshold)
     logger.warning(f"Unknown operator '{op}', returning False")
     return pd.Series(False, index=current.index)
+
+
+def _describe_condition(cond: dict[str, Any]) -> str:
+    """Human-readable one-liner for a condition dict."""
+    ind = cond.get("indicator", "?")
+    field = cond.get("field", "value")
+    op = cond.get("operator", "?")
+    val = cond.get("value", "?")
+    if isinstance(val, pd.Series):
+        val = "<series>"
+    return f"{ind}.{field} {op} {val}"
 
 
 def evaluate_conditions(
     conditions: list[dict[str, Any]],
     indicators: dict[str, pd.Series],
     logic: str = "and",
+    diagnostics: list[dict[str, Any]] | None = None,
 ) -> pd.Series:
     """Evaluate a list of conditions and combine with AND or OR logic.
 
     Each condition: {"indicator": str, "field": str, "operator": str, "value": ...}
+
+    Args:
+        diagnostics: Mutable list — per-condition hit stats are always appended
+            when provided.  Each entry contains:
+            condition, hits, hit_pct, valid_bars, nan_bars, status.
     """
+    index = next(iter(indicators.values())).index if indicators else pd.RangeIndex(0)
+    total_bars = len(index)
     if not conditions:
-        return pd.Series(False, index=next(iter(indicators.values())).index)
+        return pd.Series(False, index=index)
 
     signals: list[pd.Series] = []
-    for cond in conditions:
-        ind_key = cond["indicator"]
-        field = cond.get("field", "value")
-        # Resolve current value series
-        lookup = ind_key if field == "value" else f"{ind_key}_{field}"
-        current = indicators.get(lookup)
-        if current is None and field == "value":
-            current = indicators.get(f"{ind_key}_value")
-        if current is None:
-            current = indicators.get(ind_key)
-        if current is None:
-            logger.warning(f"Indicator '{lookup}' not found, condition skipped")
+    for idx, cond in enumerate(conditions):
+        if not isinstance(cond, dict):
+            logger.warning(f"Condition #{idx} is not an object, skipped")
+            if diagnostics is not None:
+                diagnostics.append({
+                    "condition": f"#{idx} (not a dict)",
+                    "hits": 0, "hit_pct": 0.0, "valid_bars": 0,
+                    "nan_bars": total_bars, "status": "invalid",
+                })
             continue
 
-        threshold = _resolve_value(cond["value"], indicators)
-        sig = _eval_op(current, cond["operator"], threshold)
+        indicator_raw = cond.get("indicator")
+        if indicator_raw is None:
+            logger.warning(f"Condition #{idx} missing 'indicator', skipped")
+            if diagnostics is not None:
+                diagnostics.append({
+                    "condition": _describe_condition(cond),
+                    "hits": 0, "hit_pct": 0.0, "valid_bars": 0,
+                    "nan_bars": total_bars, "status": "missing_indicator",
+                })
+            continue
+        field_raw = cond.get("field", "value")
+
+        # Allow shorthand: {"indicator": "macd.signal", ...}
+        if isinstance(indicator_raw, str) and "." in indicator_raw and _normalize_field_name(field_raw) == "value":
+            indicator_raw, field_raw = indicator_raw.split(".", 1)
+
+        current = _lookup_indicator_series(indicators, indicator_raw, field_raw)
+        if current is None:
+            logger.warning(f"Indicator '{indicator_raw}.{field_raw}' not found, condition skipped")
+            if diagnostics is not None:
+                diagnostics.append({
+                    "condition": _describe_condition(cond),
+                    "hits": 0, "hit_pct": 0.0, "valid_bars": 0,
+                    "nan_bars": total_bars, "status": "not_found",
+                })
+            continue
+
+        if "value" not in cond:
+            logger.warning(f"Condition #{idx} missing 'value', skipped")
+            if diagnostics is not None:
+                diagnostics.append({
+                    "condition": _describe_condition(cond),
+                    "hits": 0, "hit_pct": 0.0, "valid_bars": 0,
+                    "nan_bars": total_bars, "status": "missing_value",
+                })
+            continue
+        threshold = _resolve_value(cond.get("value"), indicators)
+        if isinstance(threshold, float) and math.isnan(threshold):
+            logger.warning(f"Condition #{idx} has unresolved threshold '{cond.get('value')}', skipped")
+            if diagnostics is not None:
+                diagnostics.append({
+                    "condition": _describe_condition(cond),
+                    "hits": 0, "hit_pct": 0.0, "valid_bars": 0,
+                    "nan_bars": total_bars, "status": "unresolved_threshold",
+                })
+            continue
+
+        op = _normalize_operator(cond.get("operator"))
+        if op not in _SUPPORTED_OPERATORS:
+            logger.warning(f"Condition #{idx} has unsupported operator '{cond.get('operator')}', skipped")
+            if diagnostics is not None:
+                diagnostics.append({
+                    "condition": _describe_condition(cond),
+                    "hits": 0, "hit_pct": 0.0, "valid_bars": 0,
+                    "nan_bars": total_bars, "status": "bad_operator",
+                })
+            continue
+
+        sig = _eval_op(current, op, threshold)
         signals.append(sig)
 
+        # Record per-condition diagnostics (with NaN tracking)
+        if diagnostics is not None:
+            nan_count = int(current.isna().sum())
+            if isinstance(threshold, pd.Series):
+                nan_count = max(nan_count, int(threshold.isna().sum()))
+            valid_bars = total_bars - nan_count
+            hits = int(sig.sum())
+            hit_pct = round(hits / max(valid_bars, 1) * 100, 2)
+            diagnostics.append({
+                "condition": f"{indicator_raw}.{field_raw} {op} {cond.get('value')}",
+                "hits": hits,
+                "hit_pct": hit_pct,
+                "valid_bars": valid_bars,
+                "nan_bars": nan_count,
+                "status": "ok",
+            })
+
     if not signals:
-        return pd.Series(False, index=next(iter(indicators.values())).index)
+        if diagnostics is not None:
+            diagnostics.append({
+                "condition": f"combined ({_normalize_token(logic)})",
+                "hits": 0, "hit_pct": 0.0, "valid_bars": 0,
+                "nan_bars": total_bars, "status": "combined",
+            })
+        return pd.Series(False, index=index)
 
     combined = signals[0]
+    logic_norm = _normalize_token(logic)
     for s in signals[1:]:
-        combined = (combined & s) if logic == "and" else (combined | s)
-    return combined.fillna(False)
+        combined = (combined & s) if logic_norm != "or" else (combined | s)
+    result = combined.fillna(False)
+
+    if diagnostics is not None:
+        combined_hits = int(result.sum())
+        combined_pct = round(combined_hits / max(total_bars, 1) * 100, 2)
+        diagnostics.append({
+            "condition": f"combined ({logic_norm})",
+            "hits": combined_hits,
+            "hit_pct": combined_pct,
+            "valid_bars": total_bars,
+            "nan_bars": 0,
+            "status": "combined",
+        })
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════
+# Zero-signal diagnosis
+# ═══════════════════════════════════════════════════════
+
+def _diagnose_zero_signals(
+    conditions: list[dict[str, Any]],
+    indicators: dict[str, pd.Series],
+    entry_diag: list[dict[str, Any]],
+    total_bars: int,
+) -> dict[str, Any]:
+    """Analyze WHY combined entry signals = 0 and return structured diagnosis.
+
+    Runs a *drop-one* analysis: for each condition, removes it and checks how
+    many bars the remaining conditions match.  This pinpoints which condition
+    (or pair) is the bottleneck.
+
+    Returns a dict with keys: problem, detail, bottleneck, drop_one, suggestions.
+    """
+    ok_entries = [d for d in entry_diag if d.get("status") == "ok"]
+    skipped = [d for d in entry_diag if d.get("status") not in ("ok", "combined")]
+
+    analysis: dict[str, Any] = {
+        "total_bars": total_bars,
+        "conditions_ok": len(ok_entries),
+        "conditions_skipped": len(skipped),
+    }
+
+    # ── Case B4: all conditions skipped ──
+    if not ok_entries:
+        skipped_details = [
+            {"condition": d["condition"], "reason": d["status"]} for d in skipped
+        ]
+        # Distinguish: unresolved thresholds (likely warmup) vs bad names
+        unresolved = [d for d in skipped if d.get("status") == "unresolved_threshold"]
+        not_found = [d for d in skipped if d.get("status") == "not_found"]
+
+        if unresolved and not not_found:
+            # All failures are threshold resolution → likely indicator warmup / data too short
+            analysis["problem"] = "unresolved_thresholds"
+            refs = [d["condition"] for d in unresolved]
+            analysis["detail"] = (
+                f"Threshold reference(s) could not be resolved: {refs}. "
+                "Most likely the referenced indicator produced all NaN because "
+                "the data period is too short for the indicator's lookback window."
+            )
+            analysis["suggestions"] = [
+                "Use a longer period (e.g. 1m → 6m) to provide enough bars for indicator warmup.",
+                "Reduce indicator period (e.g. EMA200 → EMA50).",
+            ]
+        else:
+            analysis["problem"] = "all_conditions_skipped"
+            analysis["detail"] = (
+                f"None of the {len(conditions)} entry conditions could be evaluated. "
+                "Check indicator names, operator spelling, and threshold references."
+            )
+            analysis["suggestions"] = [
+                "Fix condition config — no signals can be generated as-is.",
+            ]
+        analysis["skipped"] = skipped_details
+        return analysis
+
+    # ── Case C1: warmup eats most data ──
+    worst_nan = max(ok_entries, key=lambda d: d.get("nan_bars", 0))
+    nan_ratio = worst_nan.get("nan_bars", 0) / max(total_bars, 1)
+    if nan_ratio > 0.8:
+        analysis["problem"] = "insufficient_data_after_warmup"
+        analysis["detail"] = (
+            f"Indicator warmup consumes {worst_nan['nan_bars']}/{total_bars} bars "
+            f"({nan_ratio:.0%}). Only {worst_nan.get('valid_bars', 0)} bars are "
+            f"evaluable for condition '{worst_nan['condition']}'."
+        )
+        analysis["suggestions"] = [
+            "Use a longer period (e.g. 3m → 6m) to provide more data after warmup.",
+            "Reduce indicator period (e.g. EMA200 → EMA50).",
+        ]
+        return analysis
+
+    # ── Case A2: one condition individually has 0 hits ──
+    zero_hit = [d for d in ok_entries if d["hits"] == 0]
+    if zero_hit:
+        bottleneck = zero_hit[0]
+        analysis["problem"] = "impossible_condition"
+        analysis["detail"] = (
+            f"Condition '{bottleneck['condition']}' never triggers across "
+            f"{bottleneck.get('valid_bars', total_bars)} valid bars."
+        )
+        analysis["bottleneck"] = bottleneck["condition"]
+        analysis["suggestions"] = [
+            f"Relax the threshold for '{bottleneck['condition']}'.",
+            "Check if the threshold is realistic for this timeframe / coin set.",
+        ]
+        return analysis
+
+    # ── Case A1/A3: conditions individually fire but AND = 0 → contradictory ──
+    # Drop-one analysis: remove each condition, re-evaluate the rest.
+    drop_one: list[dict[str, Any]] = []
+    for i, cond in enumerate(conditions):
+        if not isinstance(cond, dict):
+            continue
+        subset = conditions[:i] + conditions[i + 1:]
+        if not subset:
+            continue
+        # Re-evaluate without diagnostics (fast path)
+        remaining_sig = evaluate_conditions(subset, indicators, logic="and")
+        remaining_hits = int(remaining_sig.sum())
+        drop_one.append({
+            "dropped": _describe_condition(cond),
+            "remaining_hits": remaining_hits,
+            "remaining_pct": round(remaining_hits / max(total_bars, 1) * 100, 2),
+        })
+
+    analysis["drop_one"] = drop_one
+
+    if drop_one:
+        best = max(drop_one, key=lambda d: d["remaining_hits"])
+        if best["remaining_hits"] > 0:
+            analysis["problem"] = "contradictory_conditions"
+            analysis["detail"] = (
+                f"Each condition fires individually, but they never overlap (AND = 0). "
+                f"Removing '{best['dropped']}' would produce {best['remaining_hits']} "
+                f"entry signals ({best['remaining_pct']}%)."
+            )
+            analysis["bottleneck"] = best["dropped"]
+            analysis["suggestions"] = [
+                f"Remove or relax '{best['dropped']}' — it contradicts the other conditions.",
+                "Switch from AND to OR logic if conditions represent alternative signals.",
+                "Change timeframe (shorter TF = more candles = more chances for overlap).",
+            ]
+        else:
+            # Even dropping one condition still yields 0 — deeply contradictory
+            analysis["problem"] = "all_pairs_contradictory"
+            analysis["detail"] = (
+                "Removing any single condition still yields 0 signals. "
+                "Multiple condition pairs are mutually exclusive."
+            )
+            analysis["suggestions"] = [
+                "Redesign entry logic — current conditions cannot co-occur.",
+                "Try keeping only 1-2 conditions and test individually.",
+            ]
+    else:
+        analysis["problem"] = "unknown"
+        analysis["detail"] = "Could not determine cause of zero signals."
+
+    return analysis
 
 
 # ═══════════════════════════════════════════════════════
@@ -230,24 +740,58 @@ def run_backtest(
     Returns:
         JSON-serialisable dict with metrics, equity curve, and trade list.
     """
-    direction = config.get("direction", "long")
-    sl_pct = config.get("stop_loss_pct")
-    tp_pct = config.get("take_profit_pct")
-    size_pct = config.get("trade_size_pct", 100.0) / 100.0
-    fees = config.get("fees", 0.0006)
+    direction = _normalize_direction(config.get("direction", "long"))
+    sl_pct = _to_float(config.get("stop_loss_pct"))
+    tp_pct = _to_float(config.get("take_profit_pct"))
+    fees = _to_float(config.get("fees"), 0.0006) or 0.0006
+
+    size_raw = _to_float(config.get("trade_size_pct"), 100.0)
+    if size_raw is None or size_raw <= 0:
+        logger.warning(f"Invalid trade_size_pct '{config.get('trade_size_pct')}', fallback to 100")
+        size_raw = 100.0
+    size_pct = size_raw / 100.0
+    timeframe = str(config.get("timeframe", "1h") or "1h")
 
     all_results: list[dict[str, Any]] = []
+
+    # ── Diagnostics tracking (across all symbols) ──
+    first_entry_diag: list[dict[str, Any]] = []
+    first_exit_diag: list[dict[str, Any]] = []
+    first_diag_symbol: str = ""
+    first_diag_indicators: dict[str, pd.Series] = {}
+    first_diag_total_bars: int = 0
+    symbols_with_zero_entries: int = 0
+    symbols_total: int = 0
 
     for symbol, df in ohlcv_data.items():
         if df.empty:
             continue
+        symbols_total += 1
 
         # 1. Compute indicators
         indicators = compute_indicators(df, config.get("indicators", []))
 
-        # 2. Evaluate entry / exit signals
-        entry_signals = evaluate_conditions(config.get("entry_conditions", []), indicators, logic="and")
-        exit_signals = evaluate_conditions(config.get("exit_conditions", []), indicators, logic="or")
+        # 2. Evaluate entry / exit signals (always with diagnostics)
+        entry_diag: list[dict[str, Any]] = []
+        exit_diag: list[dict[str, Any]] = []
+        entry_signals = evaluate_conditions(
+            config.get("entry_conditions", []), indicators, logic="and", diagnostics=entry_diag,
+        )
+        exit_signals = evaluate_conditions(
+            config.get("exit_conditions", []), indicators, logic="or", diagnostics=exit_diag,
+        )
+
+        entry_hits = int(entry_signals.sum())
+        if entry_hits == 0:
+            symbols_with_zero_entries += 1
+
+        # Save first symbol's diagnostics + indicators for deep analysis later
+        if not first_diag_symbol:
+            first_entry_diag = entry_diag
+            first_exit_diag = exit_diag
+            first_diag_symbol = symbol
+            first_diag_indicators = indicators
+            first_diag_total_bars = len(df)
 
         # 3. Build VectorBT portfolio
         close = df["close"]
@@ -257,6 +801,7 @@ def run_backtest(
             "size": size_pct,
             "size_type": "percent",
             "fees": fees,
+            "freq": pd.Timedelta(seconds=max(timeframe_to_seconds(timeframe), 1)),
         }
         if sl_pct is not None and sl_pct > 0:
             pf_kwargs["sl_stop"] = sl_pct / 100.0
@@ -301,6 +846,42 @@ def run_backtest(
     result["timeframe"] = config.get("timeframe", "")
     result["direction"] = direction
     result["config"] = config
+
+    # ── Always include signal diagnostics ──
+    if first_entry_diag:
+        result["entry_signal_diagnostics"] = [
+            {"symbol": first_diag_symbol, **d} for d in first_entry_diag
+        ]
+    if first_exit_diag:
+        result["exit_signal_diagnostics"] = [
+            {"symbol": first_diag_symbol, **d} for d in first_exit_diag
+        ]
+
+    # ── Deep diagnosis when zero trades detected ──
+    total_trades = result.get("total_trades", 0)
+    if isinstance(total_trades, float):
+        total_trades = int(total_trades)
+    if total_trades == 0 and symbols_with_zero_entries > 0:
+        result["signal_analysis"] = _diagnose_zero_signals(
+            config.get("entry_conditions", []),
+            first_diag_indicators,
+            first_entry_diag,
+            first_diag_total_bars,
+        )
+        result["signal_analysis"]["symbols_with_zero_entries"] = symbols_with_zero_entries
+        result["signal_analysis"]["symbols_total"] = symbols_total
+
+    # ── Warn when conditions were silently skipped (even if trades > 0) ──
+    skipped_diags = [
+        d for d in first_entry_diag
+        if d.get("status") not in ("ok", "combined")
+    ]
+    if skipped_diags:
+        result["skipped_conditions_warning"] = [
+            {"condition": d["condition"], "reason": d["status"]}
+            for d in skipped_diags
+        ]
+
     return result
 
 
@@ -312,10 +893,13 @@ def _filter_directional(
 ) -> pd.Series:
     """Filter conditions by direction tag and evaluate."""
     filtered = []
+    target = _normalize_direction(target_dir)
     for c in conditions:
-        d = str(c.get("direction", "")).lower()
-        if d and d != target_dir:
-            continue
+        raw_direction = str(c.get("direction", "") or "").strip()
+        if raw_direction:
+            d = _normalize_direction(raw_direction)
+            if d != target:
+                continue
         filtered.append(c)
     return evaluate_conditions(filtered, indicators, logic=logic)
 
@@ -338,6 +922,7 @@ def _extract_metrics(
     years = max(total_days / 365.0, 1 / 365.0)
     ending_bal = round(float(equity.iloc[-1]), 2) if len(equity) > 0 else starting_balance
     total_return = float(pf.total_return())
+    max_dd_pct = abs(_safe_metric_float(lambda: pf.drawdowns.max_drawdown())) * 100
 
     # Annualized return
     ann_return = 0.0
@@ -369,11 +954,11 @@ def _extract_metrics(
         "total_return_pct": round(total_return * 100, 4),
         "annualized_return_pct": round(ann_return, 2),
         # ── Risk metrics ──
-        "max_drawdown_pct": round(abs(float(pf.drawdowns.max_drawdown())) * 100, 2),
+        "max_drawdown_pct": round(max_dd_pct, 2),
         "max_drawdown_duration_days": round(dd_duration_days, 1),
-        "sharpe_ratio": _safe_float(pf.sharpe_ratio()),
-        "sortino_ratio": _safe_float(pf.sortino_ratio()),
-        "calmar_ratio": round(ann_return / max(abs(float(pf.drawdowns.max_drawdown())) * 100, 0.01), 2),
+        "sharpe_ratio": _safe_float(_safe_metric_float(lambda: pf.sharpe_ratio())),
+        "sortino_ratio": _safe_float(_safe_metric_float(lambda: pf.sortino_ratio())),
+        "calmar_ratio": round(ann_return / max(max_dd_pct, 0.01), 2),
         # ── Trade quality ──
         "total_trades": total_trades,
         "win_rate_pct": round(float(trades.win_rate()) * 100, 2) if total_trades > 0 else 0.0,
@@ -427,7 +1012,8 @@ def _extract_metrics(
             closed = records[records["Status"] == "Closed"] if "Status" in records.columns else records
             if len(closed) > 0:
                 monthly_df = closed.copy()
-                monthly_df["month"] = pd.to_datetime(monthly_df["Exit Timestamp"]).dt.to_period("M")
+                exit_ts = pd.to_datetime(monthly_df["Exit Timestamp"], errors="coerce", utc=True)
+                monthly_df["month"] = exit_ts.dt.tz_localize(None).dt.to_period("M")
                 monthly_pnl = monthly_df.groupby("month")["PnL"].sum()
                 metrics["monthly_pnl"] = {
                     str(k): round(float(v), 2) for k, v in monthly_pnl.items()
@@ -562,25 +1148,65 @@ def _safe_float(val: Any) -> float:
         return 0.0
 
 
+def _safe_metric_float(metric_fn: Any, default: float = 0.0) -> float:
+    """Safely evaluate a portfolio metric function that may raise."""
+    try:
+        return float(metric_fn())
+    except Exception as e:
+        logger.warning(f"Metric evaluation failed, fallback to {default}: {e}")
+        return default
+
+
 # ═══════════════════════════════════════════════════════
 # Chart generation (optional artifact)
 # ═══════════════════════════════════════════════════════
 
-def generate_chart(
+async def generate_chart(
     metrics: dict[str, Any],
     save_dir: Path | None = None,
 ) -> str | None:
     """Generate a professional multi-panel backtest dashboard.
+
+    Tries the Playwright/ECharts renderer first for modern, high-quality output.
+    Falls back to matplotlib if Playwright is unavailable or fails.
+
+    Returns file path or *None* if no equity data.
+    """
+    curve = metrics.get("equity_curve") or metrics.get("_equity_curve")
+    if not curve:
+        return None
+
+    # ── Try modern renderer first ──
+    try:
+        from getall.charts import PLAYWRIGHT_AVAILABLE, render_chart
+
+        if PLAYWRIGHT_AVAILABLE:
+            path = await render_chart(
+                "backtest_dashboard",
+                metrics,
+                save_dir=save_dir,
+            )
+            logger.info(f"Dashboard chart saved (ECharts): {path}")
+            return str(path)
+    except Exception as exc:
+        logger.warning(f"ECharts renderer failed, falling back to matplotlib: {exc}")
+
+    # ── Matplotlib fallback ──
+    return await asyncio.to_thread(_generate_chart_matplotlib, metrics, save_dir)
+
+
+def _generate_chart_matplotlib(
+    metrics: dict[str, Any],
+    save_dir: Path | None = None,
+) -> str | None:
+    """Matplotlib fallback chart generator (legacy).
 
     Panels:
       1. Equity curve + benchmark overlay + peak line
       2. Drawdown area chart
       3. Monthly P&L heatmap
       4. Key metrics summary box
-
-    Returns file path or None if no equity data.
     """
-    # Support both single-symbol (equity_curve) and multi-symbol (_equity_curve) layouts
     curve = metrics.get("equity_curve") or metrics.get("_equity_curve")
     if not curve:
         return None
@@ -776,7 +1402,7 @@ def generate_chart(
     path = save_dir / filename
     plt.savefig(str(path), dpi=180, bbox_inches="tight", facecolor="white")
     plt.close(fig)
-    logger.info(f"Dashboard chart saved: {path}")
+    logger.info(f"Dashboard chart saved (matplotlib fallback): {path}")
     return str(path)
 
 

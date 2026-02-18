@@ -67,11 +67,19 @@ class DataHub:
         self._init_default_exchange()
 
         # 初始化 Coinglass 适配器
-        cg_api_key = self._exchanges_cfg.get("coinglass", {}).get("api_key", "")
+        # Priority: config (env) > exchanges.yaml
+        cg_api_key = (
+            trading_config.coinglass_api_key
+            or self._exchanges_cfg.get("coinglass", {}).get("api_key", "")
+        )
         self._coinglass = CoinglassAdapter(
             base_url=trading_config.coinglass_base_url,
             api_key=cg_api_key,
         )
+        if cg_api_key:
+            logger.info("Coinglass adapter initialized with API key")
+        else:
+            logger.warning("Coinglass adapter initialized WITHOUT API key — derivatives data will fail")
 
         # 初始化 Followin 适配器
         fi_api_key = self._exchanges_cfg.get("followin", {}).get("api_key", "")

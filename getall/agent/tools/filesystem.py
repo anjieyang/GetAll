@@ -76,7 +76,11 @@ class WriteFileTool(Tool):
     
     @property
     def description(self) -> str:
-        return "Write content to a file at the given path. Creates parent directories if needed."
+        return (
+            "Write content to a file for internal storage (memory, data, scripts). "
+            "IMPORTANT: Users CANNOT see workspace files — if the content is for the user, "
+            "you MUST also include it in your chat reply."
+        )
     
     @property
     def parameters(self) -> dict[str, Any]:

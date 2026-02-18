@@ -1,0 +1,36 @@
+{
+  "activations": {
+    "rage-mode": {
+      "test-user:test-chat": {
+        "activated_at": "2026-02-14T17:52:49.925124+08:00",
+        "expires_at": "2026-02-14T18:07:49.925124+08:00",
+        "cooldown_until": "2026-02-14T19:52:49.925124+08:00"
+      }
+    },
+    "poet-mode": {
+      "user2:chat2": {
+        "activated_at": "2026-02-14T17:53:02.546164+08:00",
+        "expires_at": "2026-02-14T18:13:02.546164+08:00"
+      },
+      "rap-test:c2": {
+        "activated_at": "2026-02-14T18:00:02.105901+08:00",
+        "expires_at": "2026-02-14T18:20:02.105901+08:00"
+      }
+    }
+  },
+  "announced": {
+    "rage-mode": {
+      "test-user:test-chat": true
+    },
+    "valentines-2026": {
+      "test-user:test-chat": true,
+      "user2:chat2": true,
+      "test-v2:chat-v2": true,
+      "rap-test:c2": true
+    },
+    "poet-mode": {
+      "user2:chat2": true,
+      "rap-test:c2": true
+    }
+  }
+}

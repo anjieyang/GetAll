@@ -195,6 +195,63 @@ def load_all_routes(prefer_private: bool = True) -> dict[str, LastRoute]:
     return result
 
 
+def load_all_group_routes() -> list[tuple[str, str]]:
+    """Return deduplicated ``(channel, chat_id)`` pairs for all known group chats.
+
+    Iterates every principal's stored routes and collects unique group
+    entries.  Useful for admin broadcast to all groups.
+    """
+    data = _load_all()
+    seen: set[tuple[str, str]] = set()
+    for entry in data.values():
+        grp = entry.get("group")
+        if grp:
+            key = (grp["channel"], grp["chat_id"])
+            seen.add(key)
+    return sorted(seen)
+
+
+def load_all_private_routes() -> list[tuple[str, str]]:
+    """Return deduplicated ``(channel, chat_id)`` pairs for all known private chats.
+
+    Iterates every principal's stored routes and collects unique private
+    entries.  Useful for broadcasting system notifications to all users.
+    """
+    data = _load_all()
+    seen: set[tuple[str, str]] = set()
+    for entry in data.values():
+        priv = entry.get("private")
+        if priv and priv.get("channel") and priv.get("chat_id"):
+            seen.add((priv["channel"], priv["chat_id"]))
+    return sorted(seen)
+
+
+def remove_stale_route(channel: str, chat_id: str) -> int:
+    """Remove all route entries matching *channel* + *chat_id*.
+
+    Called when a broadcast/send receives a permanent delivery failure
+    (e.g. bot removed from chat, user deleted conversation).
+
+    Returns the number of entries removed.
+    """
+    data = _load_all()
+    removed = 0
+    for pid in list(data):
+        entry = data[pid]
+        for slot in ("private", "group"):
+            r = entry.get(slot)
+            if r and r.get("channel") == channel and r.get("chat_id") == chat_id:
+                del entry[slot]
+                removed += 1
+        # Drop the principal entirely if no routes remain
+        if not entry:
+            del data[pid]
+    if removed:
+        _save_all(data)
+        logger.info(f"Removed {removed} stale route(s) for {channel}:{chat_id}")
+    return removed
+
+
 def is_external_channel(channel: str) -> bool:
     """Return ``True`` if *channel* represents a real user-facing chat platform."""
     return channel.lower() in _EXTERNAL_CHANNELS

@@ -57,6 +57,26 @@ reminders(action="list")
 reminders(action="remove", job_id="abc123")
 ```
 
+## Task-Scoped Heartbeat
+
+For long-running operations (backtest, large data fetch), use task-scoped heartbeats
+to keep the user informed. These auto-cancel when the current task completes.
+
+```text
+# Before calling a long tool, schedule a progress check-in
+reminders(task_scoped=true, delay_seconds=60, message="回测还在跑，再等一会儿~")
+
+# Then call the long-running tool
+run_backtest(...)
+```
+
+**Rules:**
+- Only set heartbeats for tasks you expect to take >30 seconds
+- Use "Recent Tool Execution Times" in context to estimate duration
+- Set delay_seconds to ~50-70% of expected duration
+- Keep messages natural and short, especially in group chats
+- Heartbeats auto-cancel — no cleanup needed
+
 ## Time Expressions
 
 | User says          | Parameters                                          |
